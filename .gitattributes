@@ -1,0 +1,2 @@
+*.rs merge=git-weld
+*.py merge=git-weld
