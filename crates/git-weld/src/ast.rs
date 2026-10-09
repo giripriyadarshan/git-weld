@@ -1,6 +1,7 @@
 mod items;
 
 use items::{Item, Segment};
+use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -10,7 +11,7 @@ use std::{
 };
 use tree_sitter::{Node, Parser, Point, Tree};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Language {
     Rust,
     Python,
