@@ -10,3 +10,6 @@ edition = "2024"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
+tree-sitter = "0.27"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"

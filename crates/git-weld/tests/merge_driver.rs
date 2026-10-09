@@ -11,12 +11,16 @@ struct MergeFixture {
 
 impl MergeFixture {
     fn new() -> Self {
+        Self::with_contents("base\n", "ours\n", "theirs\n")
+    }
+
+    fn with_contents(base: &str, ours: &str, theirs: &str) -> Self {
         let fixture = Self {
             directory: tempdir().unwrap(),
         };
-        fs::write(fixture.path("base"), "base\n").unwrap();
-        fs::write(fixture.path("ours"), "ours\n").unwrap();
-        fs::write(fixture.path("theirs"), "theirs\n").unwrap();
+        fs::write(fixture.path("base"), base).unwrap();
+        fs::write(fixture.path("ours"), ours).unwrap();
+        fs::write(fixture.path("theirs"), theirs).unwrap();
         fixture
     }
 
@@ -25,6 +29,10 @@ impl MergeFixture {
     }
 
     fn command(&self) -> Command {
+        self.command_for("source file.rs")
+    }
+
+    fn command_for(&self, logical_path: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_git-weld"));
         command
             .env_remove("WELD_PROVIDER")
@@ -34,7 +42,7 @@ impl MergeFixture {
             .arg(self.path("ours"))
             .arg("-b")
             .arg(self.path("theirs"))
-            .args(["-p", "source file.rs"]);
+            .args(["-p", logical_path]);
         command
     }
 }
@@ -55,6 +63,112 @@ fn cli_writes_conflicts_and_reports_input_paths() {
     assert_eq!(
         fs::read(fixture.path("ours")).unwrap(),
         b"<<<<<<< HEAD\nours\n||||||| base\nbase\n=======\ntheirs\n>>>>>>> theirs\n"
+    );
+}
+
+#[test]
+fn cli_reports_items_changed_on_both_sides() {
+    let base = "fn alpha() -> u32 {\n    1\n}\n\nfn beta() -> u32 {\n    2\n}\n";
+    let ours = base
+        .replace("    1\n", "    10\n")
+        .replace("    2\n", "    20\n");
+    let theirs = base
+        .replace("    1\n", "    100\n")
+        .replace("    2\n", "    200\n");
+    let fixture = MergeFixture::with_contents(base, &ours, &theirs);
+
+    let output = fixture.command_for("src/lib.rs").output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostics = String::from_utf8(output.stderr).unwrap();
+    assert!(diagnostics.contains("manual merge required for src/lib.rs"));
+    assert!(
+        diagnostics.ends_with(
+            "git-weld: 2 Rust items changed on both sides:\n\
+             git-weld:   fn alpha: modified on both sides \
+             (base lines 1-3, ours lines 1-3, theirs lines 1-3)\n\
+             git-weld:   fn beta: modified on both sides \
+             (base lines 5-7, ours lines 5-7, theirs lines 5-7)\n"
+        ),
+        "{diagnostics}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path("ours")).unwrap(),
+        format!("<<<<<<< HEAD\n{ours}||||||| base\n{base}=======\n{theirs}>>>>>>> theirs\n")
+    );
+}
+
+#[test]
+fn cli_reports_when_edits_touch_different_items() {
+    let base = "def alpha():\n    return 1\n\n\ndef beta():\n    return 2\n";
+    let ours = base.replace("return 1", "return 10");
+    let theirs = base.replace("return 2", "return 20");
+    let fixture = MergeFixture::with_contents(base, &ours, &theirs);
+
+    let output = fixture.command_for("app.py").output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .ends_with("git-weld: no Python item changed on both sides\n")
+    );
+    assert!(
+        fs::read_to_string(fixture.path("ours"))
+            .unwrap()
+            .starts_with("<<<<<<< HEAD\n")
+    );
+}
+
+#[test]
+fn analysis_failures_still_fall_back_to_manual_resolution() {
+    for (logical_path, base, ours, theirs, reason) in [
+        (
+            "notes.txt",
+            "a\n",
+            "b\n",
+            "c\n",
+            "unsupported file type (supported: .rs, .py)",
+        ),
+        (
+            "app.py",
+            "x = 1\n",
+            "x = 2\n",
+            "x = (\n",
+            "theirs has a syntax error at line ",
+        ),
+        (
+            "lib.rs",
+            "fn a() {}\n",
+            "fn a( {}\n",
+            "fn b() {}\n",
+            "ours has a syntax error at line 1",
+        ),
+    ] {
+        let fixture = MergeFixture::with_contents(base, ours, theirs);
+
+        let output = fixture.command_for(logical_path).output().unwrap();
+
+        assert_eq!(output.status.code(), Some(1), "{logical_path}");
+        let diagnostics = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            diagnostics.contains(&format!("git-weld: semantic analysis skipped: {reason}")),
+            "{diagnostics}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path("ours")).unwrap(),
+            format!("<<<<<<< HEAD\n{ours}||||||| base\n{base}=======\n{theirs}>>>>>>> theirs\n")
+        );
+    }
+
+    let fixture = MergeFixture::with_contents("fn a() {}\n", "fn a() {}\n", "fn a() {}\n");
+    fs::write(fixture.path("theirs"), b"fn a() { \"\xff\" }\n").unwrap();
+    let output = fixture.command_for("lib.rs").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("git-weld: semantic analysis skipped: theirs is not valid UTF-8")
     );
 }
 
@@ -206,24 +320,27 @@ fn git_success(repository: &Path, arguments: &[&str]) {
 
 #[test]
 fn git_invokes_driver_for_rust_and_python_conflicts() {
-    for (path, base, ours, theirs) in [
+    for (path, base, ours, theirs, item) in [
         (
             "answer with spaces.rs",
             "fn answer() -> u32 { 0 }\n",
             "fn answer() -> u32 { 1 }\n",
             "fn answer() -> u32 { 2 }\n",
+            "fn answer",
         ),
         (
             "answer with spaces.py",
             "def answer():\n    return 0\n",
             "def answer():\n    return 1\n",
             "def answer():\n    return 2\n",
+            "def answer",
         ),
         (
             "-leading-hyphen.rs",
             "fn answer() -> u32 { 0 }\n",
             "fn answer() -> u32 { 1 }\n",
             "fn answer() -> u32 { 2 }\n",
+            "fn answer",
         ),
     ] {
         let directory = tempdir().unwrap();
@@ -271,10 +388,13 @@ fn git_invokes_driver_for_rust_and_python_conflicts() {
         let output = git(repository, &["merge", "--no-edit", "theirs"]);
 
         assert_eq!(output.status.code(), Some(1));
+        let diagnostics = String::from_utf8(output.stderr).unwrap();
+        assert!(diagnostics.contains(&format!("manual merge required for {path}")));
         assert!(
-            String::from_utf8(output.stderr)
-                .unwrap()
-                .contains(&format!("manual merge required for {path}"))
+            diagnostics.contains(&format!(
+                "git-weld:   {item}: modified on both sides (base line"
+            )),
+            "{diagnostics}"
         );
         assert_eq!(
             fs::read_to_string(repository.join(path)).unwrap(),

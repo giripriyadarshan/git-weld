@@ -2,26 +2,40 @@ use anyhow::{Context, Result, ensure};
 use std::{fs, io::Write, path::Path};
 use tempfile::NamedTempFile;
 
-pub fn write_manual_conflict(
-    base: &Path,
-    ours: &Path,
-    theirs: &Path,
-    marker_size: u16,
-) -> Result<()> {
+#[derive(Debug)]
+pub struct Versions {
+    pub base: Vec<u8>,
+    pub ours: Vec<u8>,
+    pub theirs: Vec<u8>,
+}
+
+impl Versions {
+    pub fn read(base: &Path, ours: &Path, theirs: &Path) -> Result<Self> {
+        Ok(Self {
+            base: read_version(base, "base")?,
+            ours: read_version(ours, "ours")?,
+            theirs: read_version(theirs, "theirs")?,
+        })
+    }
+}
+
+pub fn write_manual_conflict(output: &Path, versions: &Versions, marker_size: u16) -> Result<()> {
     ensure!(
         marker_size > 0,
         "conflict marker size must be greater than zero"
     );
 
-    let base_content = read_version(base, "base")?;
-    let ours_content = read_version(ours, "ours")?;
-    let theirs_content = read_version(theirs, "theirs")?;
-    let conflict = render_conflict(&base_content, &ours_content, &theirs_content, marker_size);
+    let conflict = render_conflict(
+        &versions.base,
+        &versions.ours,
+        &versions.theirs,
+        marker_size,
+    );
 
-    let permissions = fs::metadata(ours)
-        .with_context(|| format!("failed to inspect output file {}", ours.display()))?
+    let permissions = fs::metadata(output)
+        .with_context(|| format!("failed to inspect output file {}", output.display()))?
         .permissions();
-    let parent = ours
+    let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
@@ -39,8 +53,8 @@ pub fn write_manual_conflict(
         .sync_all()
         .context("failed to sync conflict output")?;
     replacement
-        .persist(ours)
-        .with_context(|| format!("failed to replace output file {}", ours.display()))?;
+        .persist(output)
+        .with_context(|| format!("failed to replace output file {}", output.display()))?;
 
     Ok(())
 }
@@ -132,7 +146,8 @@ mod tests {
         fs::write(&ours, b"ours\n").unwrap();
         fs::write(&theirs, b"theirs\n").unwrap();
 
-        write_manual_conflict(&base, &ours, &theirs, 7).unwrap();
+        let versions = Versions::read(&base, &ours, &theirs).unwrap();
+        write_manual_conflict(&ours, &versions, 7).unwrap();
 
         assert_eq!(fs::read(&base).unwrap(), b"base\n");
         assert_eq!(fs::read(&theirs).unwrap(), b"theirs\n");
@@ -152,7 +167,7 @@ mod tests {
         fs::write(&base, b"base\n").unwrap();
         fs::write(&ours, b"ours\n").unwrap();
 
-        let error = write_manual_conflict(&base, &ours, &theirs, 7).unwrap_err();
+        let error = Versions::read(&base, &ours, &theirs).unwrap_err();
 
         assert!(error.to_string().contains("failed to read theirs file"));
         assert_eq!(fs::read(&ours).unwrap(), b"ours\n");
@@ -160,13 +175,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_marker_size_before_reading_files() {
-        let missing = Path::new("missing");
-        let error = write_manual_conflict(missing, missing, missing, 0).unwrap_err();
+    fn rejects_zero_marker_size_before_touching_the_output() {
+        let directory = tempdir().unwrap();
+        let output = directory.path().join("missing");
+        let versions = Versions {
+            base: b"base\n".to_vec(),
+            ours: b"ours\n".to_vec(),
+            theirs: b"theirs\n".to_vec(),
+        };
+
+        let error = write_manual_conflict(&output, &versions, 0).unwrap_err();
+
         assert_eq!(
             error.to_string(),
             "conflict marker size must be greater than zero"
         );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
@@ -183,7 +207,8 @@ mod tests {
         fs::write(&theirs, b"theirs\n").unwrap();
         fs::set_permissions(&ours, fs::Permissions::from_mode(0o640)).unwrap();
 
-        write_manual_conflict(&base, &ours, &theirs, 7).unwrap();
+        let versions = Versions::read(&base, &ours, &theirs).unwrap();
+        write_manual_conflict(&ours, &versions, 7).unwrap();
 
         assert_eq!(
             fs::metadata(&ours).unwrap().permissions().mode() & 0o777,

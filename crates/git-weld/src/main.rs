@@ -1,13 +1,20 @@
 use clap::{Parser, builder::NonEmptyStringValueParser};
-use git_weld::merge::write_manual_conflict;
-use std::{path::PathBuf, process::ExitCode};
+use git_weld::{
+    ast,
+    merge::{Versions, write_manual_conflict},
+};
+use std::{
+    panic,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 // Path values may start with '-' (e.g. a top-level file named `-lib.rs` in %P),
 // so they are never parsed as flags.
 #[derive(Parser)]
 #[command(
     version,
-    about = "Semantic Git merge driver (Phase 1: manual-conflict fallback)"
+    about = "Semantic Git merge driver (Phase 2: manual fallback with AST conflict reports)"
 )]
 struct Cli {
     #[arg(
@@ -69,25 +76,53 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match write_manual_conflict(&cli.base, &cli.ours, &cli.theirs, cli.marker_size) {
-        Ok(()) => {
-            eprintln!(
-                "git-weld: manual merge required for {} \
-                 (requested provider: {}; model evaluation is not implemented)",
-                cli.path.display(),
-                cli.provider
-            );
-            eprintln!(
-                "git-weld: base={}, ours={}, theirs={}",
-                cli.base.display(),
-                cli.ours.display(),
-                cli.theirs.display()
-            );
-            ExitCode::from(1)
-        }
+    let written = Versions::read(&cli.base, &cli.ours, &cli.theirs).and_then(|versions| {
+        write_manual_conflict(&cli.ours, &versions, cli.marker_size)?;
+        Ok(versions)
+    });
+    let versions = match written {
+        Ok(versions) => versions,
         Err(error) => {
             eprintln!("git-weld: {error:#}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+
+    eprintln!(
+        "git-weld: manual merge required for {} \
+         (requested provider: {}; model evaluation is not implemented)",
+        cli.path.display(),
+        cli.provider
+    );
+    eprintln!(
+        "git-weld: base={}, ours={}, theirs={}",
+        cli.base.display(),
+        cli.ours.display(),
+        cli.theirs.display()
+    );
+    report_conflicting_items(&cli.path, &versions);
+    ExitCode::from(1)
+}
+
+// The conflict is already written, so the analysis only adds diagnostics and
+// can never change the merge result or exit code.
+fn report_conflicting_items(path: &Path, versions: &Versions) {
+    let analysis = panic::catch_unwind(|| {
+        ast::analyze(path, &versions.base, &versions.ours, &versions.theirs)
+    });
+    match analysis {
+        Ok(Ok(analysis)) => {
+            let language = analysis.language;
+            match analysis.conflicts.len() {
+                0 => eprintln!("git-weld: no {language} item changed on both sides"),
+                1 => eprintln!("git-weld: 1 {language} item changed on both sides:"),
+                count => eprintln!("git-weld: {count} {language} items changed on both sides:"),
+            }
+            for conflict in &analysis.conflicts {
+                eprintln!("git-weld:   {conflict}");
+            }
+        }
+        Ok(Err(error)) => eprintln!("git-weld: semantic analysis skipped: {error}"),
+        Err(_) => eprintln!("git-weld: semantic analysis failed unexpectedly"),
     }
 }

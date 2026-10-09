@@ -9,3 +9,6 @@ readme = "../../README.md"
 anyhow.workspace = true
 clap.workspace = true
 tempfile.workspace = true
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
