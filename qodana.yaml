@@ -1,0 +1,45 @@
+# Qodana configuration: https://www.jetbrains.com/help/qodana/qodana-yaml.html
+# This file is copied into every Qodana report, so keep secrets out of it.
+version: "1.0"
+
+# Qodana for Rust is RustRover-based and still EAP, so the Qodana CLI and the
+# CI integrations resolve this name to jetbrains/qodana-rust:<release>-eap.
+linter: qodana-rust
+
+# For Rust, qodana.recommended runs the same inspections as qodana.starter and
+# only adds slower generic checks such as duplicate-code detection.
+profile:
+  name: qodana.starter
+
+# Runs inside the Docker image before the analysis; RustRover's own Qodana run
+# skips it. The image has no C compiler, so rustc cannot link build scripts or
+# proc macros and the Cargo project fails to load; gcc fixes that. The image's
+# Rust (1.94 in 2026.2) is also older than the stable toolchain CI uses, so
+# install that too: newer std APIs then resolve, and dependencies that need a
+# newer rustc still build.
+# Only root can write to the image's CARGO_HOME. As any other user Cargo
+# downloads nothing and Qodana passes without analyzing anything, so stop early
+# instead: run the container as root, e.g. `qodana scan --user root`.
+bootstrap: |
+  set -eu
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Qodana for Rust must run as root (qodana scan --user root)" >&2
+    exit 1
+  fi
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends gcc libc6-dev
+  rustup toolchain install stable --profile minimal --component rust-src
+  rustup default stable
+
+# rustc already enforces both, and CI denies its warnings, so here they only add
+# false positives: RsLiveness takes the MAX_REQUEST_BYTES constant pattern in
+# provider/jev.rs for an unused binding, and RsBorrowChecker reports moves that
+# never happen when the Docker run inspects code before its macros expand.
+exclude:
+  - name: RsLiveness
+  - name: RsBorrowChecker
+
+# Fail on any problem, like `cargo clippy -- -D warnings` in CI.
+failureConditions:
+  severityThresholds:
+    any: 0
