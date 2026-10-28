@@ -4,53 +4,95 @@ A model-agnostic semantic Git merge driver in Rust.
 
 ## Current scope
 
-Phases 1 to 3 are implemented: **Foundation & Git Hook Plumbing**, the **AST
-parsing engine**, and the **System One provider abstraction**. The Rust 2024
-workspace contains a `clap` CLI, a merge module, a `tree-sitter` analysis
-module, a semantic state builder, a provider layer with a client for TypeSafe
-AI's Jev and an offline mock, and real Git integration tests for Rust and Python
-files.
+Phases 1 to 5 are implemented: **Foundation & Git Hook Plumbing**, the **AST
+parsing engine**, the **System One provider abstraction**, **chunked
+auto-resolution**, and **context hoisting with an idempotent decision cache**.
+The Rust 2024 workspace contains a `clap` CLI, an in-memory line merge, a
+`tree-sitter` analysis that turns conflicts into chunks of whole items and
+hoists referenced signatures, a semantic state builder, a provider layer with
+clients for TypeSafe AI's Jev, Ollama's System One models (`kev`, `laya`,
+`clef`, and others), and an offline mock, a SQLite decision cache, a decision
+log for editors, and real Git integration tests for Rust and Python files.
 
-The driver still **always requires manual resolution**. It reads the base,
-ours, and theirs files, writes a full-file diff3 conflict into `%A`, reports the
-input paths on stderr, and exits with code `1`. All three versions are included;
-missing final newlines are added so markers stay on separate lines. Replacement
-is atomic and preserves the output file's permissions. Input or output errors
-are reported on stderr and exit with code `2`.
+### How a merge runs
 
-After writing the conflict, the driver parses all three versions with
-`tree-sitter`, choosing the grammar from the `%P` extension (`.rs` or `.py`), and
-lists the items that both sides changed relative to the base:
+1. **Line merge.** The driver reads the base, ours, and theirs versions and
+   merges them in memory by lines, like `git merge-file` with the histogram
+   diff that Git's own merge uses. Edits that do not overlap combine, and
+   identical edits count once. A file without conflicts is written as merged
+   and the driver exits with code `0` without consulting a model, as Git's own
+   merge would.
+2. **Chunks and hoisted signatures.** The driver parses all three versions with
+   `tree-sitter`, choosing the grammar from the `%P` extension (`.rs` or
+   `.py`), and widens every remaining conflict to the smallest enclosing items.
+   A conflict inside a function covers that function, a conflict spanning two
+   adjacent items covers both, and conflicts inside the same item share one
+   chunk. Members of `impl`, `trait`, `mod`, and `extern` blocks and of Python
+   classes are chunks of their own unless the conflict touches the container
+   itself, such as its header. Items include their leading comments,
+   attributes, and decorators. A `tree-sitter` query also collects the types,
+   traits, classes, functions, and methods each chunk references in the same
+   file and hoists their signatures (without executable bodies) into the
+   semantic state.
+3. **Decision cache and provider.** Before calling a remote or local model,
+   each chunk is looked up in `.git/git-weld/cache` (under
+   `git rev-parse --git-common-dir`, so linked worktrees share it) by a
+   SHA-256 hash of the provider, the configured model, the language, the
+   chunk's Base, Ours, and Theirs code, and the hoisted signatures that chunk
+   references. Cache hits are reused immediately; only misses go to the
+   configured [provider](#providers) in a single request, and valid answers
+   (when no hoisted signatures had to be trimmed) are stored for 30 days.
+   `--no-cache` or `WELD_NO_CACHE` bypasses the cache.
+4. **Stitching.** A chunk whose decision is `TakeOurs` or `TakeTheirs` with a
+   confidence strictly greater than `0.95` is replaced by that side's code for
+   the whole chunk; exactly `0.95` is not enough. Every other conflict keeps
+   standard conflict markers around that conflict only, while confident
+   chunks in the same file stay resolved. If the stitched file does not parse,
+   every chunk keeps its markers. The driver exits with code `0` when no
+   markers are left and `1` otherwise.
+
+For a file with three conflicts, the driver reports:
 
 ```text
-git-weld: 1 Rust item changed on both sides:
-git-weld:   impl Counter > fn get: modified on both sides (base lines 6-8, ours lines 6-8, theirs lines 6-9)
+git-weld: src/lib.rs: 3 conflicts in 3 chunks (provider: jev):
+git-weld:   chunk 1: fn alpha
+git-weld:   chunk 2: impl Counter > fn get
+git-weld:   chunk 3: fn gamma
+git-weld: jev decided 3 chunks:
+git-weld:   chunk 1: TakeOurs, confidence 0.98, above the 0.95 threshold: jev-1.13.0 chose TakeOurs (probabilities: Manual 0.01, TakeOurs 0.98, TakeTheirs 0.01)
+git-weld:   chunk 2: Manual, confidence 0.72: jev-1.13.0 chose Manual (probabilities: Manual 0.72, TakeOurs 0.2, TakeTheirs 0.08)
+git-weld:   chunk 3: TakeTheirs, confidence 0.97, above the 0.95 threshold: jev-1.13.0 chose TakeTheirs (probabilities: Manual 0.02, TakeOurs 0.01, TakeTheirs 0.97)
+git-weld: resolved 2 of 3 chunks; 1 left for manual resolution, at lines 9-19
 ```
 
-Items are declarations such as functions, structs, enums, traits, classes,
-imports, and module-level statements. Methods and other members of `impl`,
-`trait`, `mod`, and `extern` blocks and of Python classes are compared one by
-one, so edits to two different methods do not count as a conflict. Comments,
-attributes, and decorators belong to the item that follows them. An item is
-reported when both sides modified it differently, both added it with different
-content, or one side deleted it while the other changed it. Identical edits are
-not reported, and neither are formatting-only edits: whitespace, indentation,
-line breaks, spacing inside comments, line endings, and optional trailing
-commas. Reordering items with different names is not a change either. String
-literals are compared exactly.
+Conflict markers use the diff3 style with the labels `HEAD`, `base`, and
+`theirs` and honor Git's `%L` marker size. Like Git, the driver ends markers
+in CRLF when the surrounding lines do and adds a missing final newline inside
+a conflict, so markers always start on their own line. Replacement is atomic
+and preserves the output file's permissions. Input or output errors are
+reported on stderr and exit with code `2`, leaving `%A` untouched.
 
-When a [provider](#providers) is configured and at least one item changed on
-both sides, the driver describes those items neutrally (each version's code
-plus a unified diff from the base) and asks the provider how to resolve each
-one. The answers are reported, but in this build they are advisory:
+Every problem falls back to the line merge's markers: an unsupported file
+type, input that is not valid UTF-8, a syntax error in any version, a conflict
+outside every item (such as a comment at the end of the file), an unknown or
+unconfigured provider, a refused connection, an HTTP error, a timeout, an
+answer that breaks the decision schema, a decision that is `Manual` or not
+confident enough, and a stitched file that does not parse. A Python block
+without statements counts as a syntax error, as it does in Python.
+
+When both sides changed the same item but their edits do not overlap, the
+line merge combines them without asking a model, just like Git. Combined
+edits can still clash in meaning, so the driver points such items out:
 
 ```text
-git-weld: jev decided 1 item:
-git-weld:   impl Counter > fn get: TakeTheirs, confidence 0.97, above the 0.95 threshold: jev-1.13.0 chose TakeTheirs (probabilities: Manual 0.01, TakeOurs 0.01, TakeTheirs 0.98)
-git-weld: automatic resolution is not implemented yet; the conflict is left for manual resolution
+git-weld: note: both sides changed fn alpha, but the edits do not overlap, so they were merged line by line
 ```
 
-Every provider answers in the same shape, one decision per item:
+These notes ignore formatting-only edits (whitespace, indentation, line
+breaks, spacing inside comments, line endings, and optional trailing commas)
+and identical edits. String literals are compared exactly.
+
+Every provider answers in the same shape, one decision per chunk:
 
 ```json
 {"decision": "TakeOurs", "confidence": 0.98, "reason": "..."}
@@ -59,18 +101,24 @@ Every provider answers in the same shape, one decision per item:
 `decision` is `TakeOurs`, `TakeTheirs`, or `Manual`, and `confidence` is a
 number from 0 to 1. Unknown fields or decisions and out-of-range confidences
 are rejected; `Decision::json_schema()` publishes the same rules as a JSON
-Schema. A decision counts as confident only when it picks a side with a
-confidence strictly greater than `0.95`; exactly `0.95` is not enough.
+Schema.
 
-The report is only a diagnostic. An unsupported file type, input that is not
-valid UTF-8, or a syntax error in any version skips it with a note on stderr,
-and so does any provider problem: an unknown or unconfigured provider, a
-refused connection, an HTTP error, a timeout, or an answer that breaks the
-decision schema. The merge result and exit code are the same either way.
+### Decision log
 
-No automatic resolutions or `.git-weld.log` generation are implemented yet.
-Even changes that a normal text merge could combine, or that touch different
-items, are left for manual resolution in this build.
+Each decision is appended to `.git-weld.log` in the driver's working
+directory, which is the top of the work tree when Git runs it. Every line is
+one JSON object, so editor plugins can show the reasoning next to the code:
+
+```json
+{"time":"2026-10-12T14:42:27Z","file":"src/lib.rs","chunk":2,"items":["impl Counter > fn get"],"lines":{"start":9,"end":19},"provider":"jev","decision":"Manual","confidence":0.72,"reason":"jev-1.13.0 chose Manual (probabilities: Manual 0.72, TakeOurs 0.2, TakeTheirs 0.08)","resolved":false,"cached":false}
+```
+
+`time` is in UTC, `chunk` counts from 1 within the file, `lines` is where the
+chunk is in the merged file (the chosen side's code when `resolved` is true,
+the conflict markers otherwise), and `cached` is true when the decision came
+from `.git/git-weld/cache`. Records are only ever appended, so the newest
+record for a file and chunk is the one that applies. A log that cannot be
+written is reported on stderr and never changes the merge result.
 
 ## Providers
 
@@ -82,25 +130,30 @@ precedence over the environment, names ignore case, and the default is
 |----------|----------|----------|
 | `manual` | No model is consulted. | None |
 | `jev` | Asks TypeSafe AI's [Jev](https://docs.typesafe.ai) System One model. | `TYPESAFE_API_KEY` (required), `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), `TYPESAFE_DEFAULT_MODEL` (default `jev-latest`) |
-| `mock` | Answers from `WELD_MOCK_DECISION` without a model, for offline tests. | `WELD_MOCK_DECISION`: one decision object for every item, or an array with one decision per item |
+| `ollama` | Asks a System One model served by [Ollama](https://ollama.com) (`kev`, `laya`, `clef`, and others). | `OLLAMA_MODEL` (required, e.g. `kev:0.8b-bf16` or `laya:latest`), `OLLAMA_HOST` (default `http://127.0.0.1:11434`), `OLLAMA_API_KEY` (optional) |
+| `mock` | Answers from `WELD_MOCK_DECISION` without a model, for offline tests. | `WELD_MOCK_DECISION`: one decision object for every chunk, or an array with one decision per chunk |
 
 `--timeout` or `WELD_TIMEOUT` sets how many seconds to wait for an answer
-(default `10`, at most `3600`). Other names, including the planned `clef` and
-`sap-rst`, are reported as unknown.
+(default `10`, at most `3600`). `--no-cache` or `WELD_NO_CACHE` skips reading
+and writing `.git/git-weld/cache`. Other provider names are reported as
+unknown. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to add a provider.
 
-The `jev` provider sends one `POST /v1/systemone` request per conflicted file,
-using the same variable names as TypeSafe's SDKs. The state holds the file's
-logical path and language and, for every item that both sides changed, its
-code in each version plus the diffs from the base. Each item becomes one Choice
-question with the options `Manual`, `TakeOurs`, and `TakeTheirs`; Jev's chosen
-option and calibrated confidence become the decision, and the reason records
-the answering model and its probabilities. The base URL must use HTTPS (plain
-HTTP is accepted only for localhost), requests over 128 KiB are not sent, and
-rate limits, overload, server errors, and refused connections are retried
-twice unless the service asks to wait more than two seconds.
+Both `jev` and `ollama` send one `POST /v1/systemone` request per conflicted
+file. The state holds the file's logical path, its language, the hoisted
+signatures of items in the same file that the chunks reference, and, for every
+chunk, its items, a neutral summary, its code in each version, and the diffs
+from the base. Each chunk becomes one Choice question with the options
+`Manual`, `TakeOurs`, and `TakeTheirs`, evaluated in parallel against the
+state. When hoisted signatures would push a request over 128 KiB, the largest
+signatures are trimmed before any chunk; requests whose chunks alone exceed
+128 KiB are not sent. The base URL must use HTTPS (plain HTTP is accepted only
+for localhost), and rate limits, overload, server errors, and refused
+connections are retried twice unless the service asks to wait more than two
+seconds.
 
-With `jev`, the code of every conflicting item leaves your machine. Review
-TypeSafe's data handling terms before enabling it for private code.
+With `jev` or a remote `ollama` host, the code of every conflicting chunk and
+its hoisted signatures leaves your machine. Review the service's data handling
+terms before enabling it for private code.
 
 ## Build and run
 
@@ -120,9 +173,10 @@ cargo run --locked -- \
   -o base.rs -a ours.rs -b theirs.rs -p src/example.rs
 ```
 
-This replaces `ours.rs` with conflict markers and returns `1`; it does not modify
-`base.rs` or `theirs.rs`. `--marker-size` / `-l` accepts Git's `%L` marker length
-(default `7`, range `1` through `65535`).
+This merges the three versions into `ours.rs` and returns `0` when no conflict
+markers are left or `1` when some are; it does not modify `base.rs` or
+`theirs.rs`. `--marker-size` / `-l` accepts Git's `%L` marker length (default
+`7`, range `1` through `65535`).
 
 ## Register with Git
 
@@ -148,17 +202,19 @@ already contains:
 Copy those entries into another repository's `.gitattributes` when installing
 there. To consult a model, append `--provider jev` to the driver command or
 export `WELD_PROVIDER=jev` in the environment that runs Git. Export
-`TYPESAFE_API_KEY` there as well; keep API keys out of Git configuration. Git substitutes and shell-quotes the `%O`, `%A`, `%B`, and `%P` paths.
+`TYPESAFE_API_KEY` there as well; keep API keys out of Git configuration. Git
+substitutes and shell-quotes the `%O`, `%A`, `%B`, and `%P` paths.
 `recursive = binary` keeps internal common-ancestor merges out of the custom
-driver.
+driver. Add `.git-weld.log` to the repository's `.gitignore` or
+`.git/info/exclude` so the decision log is never committed.
 
 The initialized development repository uses a repository-local `cargo run`
 driver so it works without installing a global binary. That configuration lives
 in `.git/config`, not in tracked files; cloned repositories need the registration
 above.
 
-After a conflict, edit the marked file, remove the markers, and `git add` it.
-Continue the merge or rebase as usual.
+After a conflict, edit the marked chunks, remove the markers, and `git add` the
+file. Continue the merge or rebase as usual.
 
 ## Development
 
@@ -170,32 +226,27 @@ cargo test --workspace --locked
 
 Git integration tests create disposable repositories with their own user and
 merge-driver configuration; they do not change global Git settings. Provider
-tests never reach the network: Jev is tested against a scripted HTTP server on
-localhost, and the CLI tests ignore any `WELD_*` or `TYPESAFE_*` variables set
-in your shell. CI runs the same checks.
+tests never reach the network: `jev` and `ollama` are tested against a
+scripted HTTP server on localhost, and the CLI tests ignore any `WELD_*`,
+`TYPESAFE_*`, or `OLLAMA_*` variables set in your shell. The line merge is
+compared with `git merge-file`, so Git must be installed. CI runs the same
+checks.
 
 ```text
 Cargo.toml                        Workspace and shared dependencies
-crates/git-weld/src/main.rs       CLI, provider loading, diagnostics, exit codes
-crates/git-weld/src/merge.rs      Manual-conflict formatting and atomic output
-crates/git-weld/src/ast.rs        Language selection, parsing, three-way item comparison
-crates/git-weld/src/ast/items.rs  Item extraction and formatting-insensitive fingerprints
-crates/git-weld/src/state.rs      Semantic state: neutral plain-text and JSON descriptions
+GLOSSARY.md                       Canonical domain terms
+CODING_STANDARDS.md               Coding standards and review invariants
+CONTRIBUTING.md                   Checks and how to add a provider
+docs/adr/                         Architecture decision records
+crates/git-weld/src/main.rs       CLI, merge data flow, diagnostics, exit codes
+crates/git-weld/src/merge.rs      Line merge, conflict markers, and atomic output
+crates/git-weld/src/ast.rs        Language selection, parsing, item outlines, item comparison
+crates/git-weld/src/ast/items.rs  Item extraction, signatures, reference queries, fingerprints
+crates/git-weld/src/chunk.rs      Widening conflicts to chunks of whole items
+crates/git-weld/src/state.rs      Semantic state: chunks and hoisted signatures
+crates/git-weld/src/cache.rs      The .git/git-weld/cache SQLite decision cache
 crates/git-weld/src/provider.rs   Decision types and schema, SystemOneProvider, loading
-crates/git-weld/src/provider/     Jev (TypeSafe API) and mock providers
-crates/git-weld/tests/            CLI, Jev, and real Git merge integration tests
+crates/git-weld/src/provider/     Jev (TypeSafe API), Ollama, and mock providers
+crates/git-weld/src/log.rs        The .git-weld.log decision log
+crates/git-weld/tests/            CLI, Jev, Ollama, cache, and real Git integration tests
 ```
-
-## Next phases
-
-Phase 4 first merges each file in memory, the way `git merge-file` does, so
-edits that do not overlap combine without a model. Each remaining conflict is
-narrowed to the smallest enclosing item, all of a file's conflicts go to the
-provider in one request, and each one is decided on its own: a confident
-decision (confidence strictly greater than `0.95`) replaces just that item,
-and the rest keep standard conflict markers. Phase 4 also adds a
-`.git-weld.log` with each model's reasoning and a guide for adding providers.
-Phase 5 gives the model the signatures of the types and functions each
-conflict refers to, and caches decisions in `.git/git-weld/cache` so a rebase
-that replays the same conflict does not ask the provider again. Until then, no
-merge is treated as model-approved.
