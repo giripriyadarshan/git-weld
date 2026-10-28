@@ -8,7 +8,7 @@
 use crate::provider::MergeAction;
 use serde::Serialize;
 use std::{
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, Write},
     ops::RangeInclusive,
     path::Path,
@@ -60,6 +60,14 @@ impl From<RangeInclusive<usize>> for Lines {
 pub fn append(path: &Path, records: &[Record]) -> io::Result<()> {
     if records.is_empty() {
         return Ok(());
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write through a symlink",
+        ));
     }
     let mut buffer = Vec::new();
     for record in records {
@@ -201,5 +209,20 @@ mod tests {
         );
 
         assert_eq!(error.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_a_symlink() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("outside.txt");
+        fs::write(&target, "unchanged\n").unwrap();
+        let link = directory.path().join(FILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = append(&link, &[record(1, true)]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "unchanged\n");
     }
 }

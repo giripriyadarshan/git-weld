@@ -214,7 +214,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::Language,
-        state::{ChunkState, SignatureState, Version},
+        state::{ChunkState, SignatureState, VersionState},
     };
     use tempfile::tempdir;
 
@@ -230,17 +230,17 @@ mod tests {
             chunks: vec![ChunkState {
                 items: vec!["fn alpha".to_owned()],
                 summary: "summary".to_owned(),
-                base: Some(Version {
+                base: Some(VersionState {
                     lines: 1 + line_offset..=3 + line_offset,
                     code: "fn alpha() -> u32 {\n    1\n}".to_owned(),
                     changes: None,
                 }),
-                ours: Some(Version {
+                ours: Some(VersionState {
                     lines: 1 + line_offset..=3 + line_offset,
                     code: ours_code.to_owned(),
                     changes: None,
                 }),
-                theirs: Some(Version {
+                theirs: Some(VersionState {
                     lines: 1 + line_offset..=3 + line_offset,
                     code: theirs_code.to_owned(),
                     changes: None,

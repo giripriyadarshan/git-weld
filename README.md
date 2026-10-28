@@ -123,12 +123,12 @@ written is reported on stderr and never changes the merge result.
 ## Providers
 
 Choose a provider with `--provider` or `WELD_PROVIDER`. The flag takes
-precedence over the environment, names ignore case, and the default is
-`manual`.
+precedence over the environment, names ignore case, and the default is the
+`manual` provider.
 
 | Provider | Behavior | Settings |
 |----------|----------|----------|
-| `manual` | No model is consulted. | None |
+| `manual` | Manual provider: no model is consulted, leaving conflicts for manual resolution. | None |
 | `jev` | Asks TypeSafe AI's [Jev](https://docs.typesafe.ai) System One model. | `TYPESAFE_API_KEY` (required), `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), `TYPESAFE_DEFAULT_MODEL` (default `jev-latest`) |
 | `ollama` | Asks a System One model served by [Ollama](https://ollama.com) (`kev`, `laya`, `clef`, and others). | `OLLAMA_MODEL` (required, e.g. `kev:0.8b-bf16` or `laya:latest`), `OLLAMA_HOST` (default `http://127.0.0.1:11434`), `OLLAMA_API_KEY` (optional) |
 | `mock` | Answers from `WELD_MOCK_DECISION` without a model, for offline tests. | `WELD_MOCK_DECISION`: one decision object for every chunk, or an array with one decision per chunk |

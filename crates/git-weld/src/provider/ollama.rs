@@ -2,10 +2,10 @@
 //! through its `POST /v1/systemone` endpoint.
 
 use super::{
-    Decision, Env, ProviderError, SystemOneProvider, error_chain,
+    Decision, Env, ProviderError, SystemOneProvider,
     jev::{
-        PROMPT_REVISION, Retry, USER_AGENT, config, decisions, encode_request, is_loopback,
-        send_request, systemone_endpoint, would_trim_request,
+        PROMPT_REVISION, Retry, bearer_header, config, decisions, encode_request, http_client,
+        send_request, systemone_endpoint, trim_model, would_trim_request,
     },
 };
 use crate::state::SemanticState;
@@ -32,50 +32,18 @@ impl OllamaProvider {
     /// full `http(s)://` URL or a bare `host` / `host:port` address; plain HTTP
     /// is accepted only for loopback hosts.
     pub fn new(host: &str, model: &str, api_key: Option<&str>) -> Result<Self, ProviderError> {
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(config(format!("{} is empty", Self::MODEL_ENV)));
-        }
-
-        let authorization = match api_key {
-            Some(raw) => {
-                let key = raw.trim();
-                if key.is_empty() {
-                    return Err(config(format!("{} is empty", Self::API_KEY_ENV)));
-                }
-                if !key.bytes().all(|byte| byte.is_ascii_graphic()) {
-                    return Err(config(format!(
-                        "{} must be printable ASCII without spaces",
-                        Self::API_KEY_ENV
-                    )));
-                }
-                let header_text = ["Bearer ", key].concat();
-                let mut value = HeaderValue::try_from(header_text).map_err(|_| {
-                    config(format!("{} is not a valid header value", Self::API_KEY_ENV))
-                })?;
-                value.set_sensitive(true);
-                Some(value)
-            }
-            None => None,
-        };
-
+        let model = trim_model(Self::MODEL_ENV, model)?;
+        let authorization = api_key
+            .map(|key| bearer_header(Self::API_KEY_ENV, key))
+            .transpose()?;
         let endpoint = ollama_endpoint(host)?;
-        let mut client = Client::builder().user_agent(USER_AGENT);
-        if is_loopback(&endpoint) {
-            client = client.no_proxy();
-        }
-        let client = client.build().map_err(|error| {
-            config(format!(
-                "cannot create an HTTP client: {}",
-                error_chain(&error)
-            ))
-        })?;
+        let client = http_client(&endpoint)?;
 
         Ok(Self {
             client,
             endpoint,
             authorization,
-            model: model.to_owned(),
+            model,
             retry: Retry::default(),
         })
     }

@@ -1,7 +1,7 @@
 mod items;
 
 pub use crate::merge::Version;
-pub(crate) use items::Segment;
+pub(crate) use items::{Segment, dedent};
 
 use items::{Item, Reference};
 use serde::Serialize;

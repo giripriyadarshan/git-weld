@@ -215,7 +215,7 @@ fn jev_answers(choices: &[(&str, f64)]) -> String {
 }
 
 #[test]
-fn cli_writes_hunk_level_conflicts_when_no_model_is_configured() {
+fn cli_writes_line_level_conflicts_when_no_model_is_configured() {
     let fixture = MergeFixture::rust_conflict(true);
 
     let (code, diagnostics) = exit(fixture.command_for("src/lib.rs").output().unwrap());
@@ -1251,7 +1251,7 @@ fn git_merge_completes_when_every_chunk_is_resolved() {
 }
 
 #[test]
-fn git_merge_leaves_markers_only_around_the_chunk_left_manual() {
+fn git_merge_leaves_markers_only_around_the_chunk_with_a_manual_decision() {
     let base = format!("use std::fmt;\n\n{THREE}\nfn untouched() {{}}\n");
     let ours = base
         .replace("use std::fmt;\n", "use std::fmt;\nuse std::io;\n")
@@ -1463,7 +1463,8 @@ fn decision_cache_answers_hits_sends_only_misses_and_honors_no_cache() {
     assert_eq!(cached_flags, [json!(false), json!(false)]);
 
     // Run 2: add a third conflicting function; chunks 1 and 2 hit the cache,
-    // and only chunk 3 is sent to Jev.
+    // and only chunk 3 is sent to Jev. An empty `WELD_NO_CACHE=""` is treated
+    // as unset so the cache stays active.
     let edit = |suffix: &str| {
         THREE
             .replace("    1\n", &format!("    1{suffix}\n"))
@@ -1477,6 +1478,7 @@ fn decision_cache_answers_hits_sends_only_misses_and_honors_no_cache() {
     let (code, diagnostics) = exit(
         fixture
             .jev_command_for("src/lib.rs", &server.url())
+            .env("WELD_NO_CACHE", "")
             .output()
             .unwrap(),
     );

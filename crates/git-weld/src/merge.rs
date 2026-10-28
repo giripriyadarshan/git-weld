@@ -351,15 +351,15 @@ impl<'a> LineMerge<'a> {
         } else {
             b"\n"
         };
-        let [base, ours, theirs] = LABELS;
-        writer.end_line(eol);
-        writer.marker(b'<', size, ours, eol);
-        writer.lines(self.slice(Version::Ours, region.ours.clone()), eol);
-        writer.marker(b'|', size, base, eol);
-        writer.lines(self.slice(Version::Base, region.base.clone()), eol);
-        writer.marker(b'=', size, "", eol);
-        writer.lines(self.slice(Version::Theirs, region.theirs.clone()), eol);
-        writer.marker(b'>', size, theirs, eol);
+        writer.conflict(
+            [
+                self.slice(Version::Base, region.base.clone()),
+                self.slice(Version::Ours, region.ours.clone()),
+                self.slice(Version::Theirs, region.theirs.clone()),
+            ],
+            size,
+            eol,
+        );
     }
 
     // Git's rule (`is_cr_needed` in xdiff/xmerge.c): markers end in CRLF when
@@ -468,6 +468,18 @@ impl Writer {
         self.write(eol);
     }
 
+    fn conflict(&mut self, [base, ours, theirs]: [&[u8]; 3], size: u16, eol: &[u8]) {
+        let [base_label, ours_label, theirs_label] = LABELS;
+        self.end_line(eol);
+        self.marker(b'<', size, ours_label, eol);
+        self.lines(ours, eol);
+        self.marker(b'|', size, base_label, eol);
+        self.lines(base, eol);
+        self.marker(b'=', size, "", eol);
+        self.lines(theirs, eol);
+        self.marker(b'>', size, theirs_label, eol);
+    }
+
     fn position(&self) -> (usize, usize) {
         (self.text.len(), self.newlines)
     }
@@ -534,32 +546,9 @@ fn read_version(path: &Path, version: &str) -> Result<Vec<u8>> {
 }
 
 fn render_conflict(base: &[u8], ours: &[u8], theirs: &[u8], marker_size: u16) -> Vec<u8> {
-    let [base_label, ours_label, theirs_label] = LABELS;
-    let mut output = Vec::new();
-    append_marker(&mut output, b'<', marker_size, ours_label.as_bytes());
-    append_version(&mut output, ours);
-    append_marker(&mut output, b'|', marker_size, base_label.as_bytes());
-    append_version(&mut output, base);
-    append_marker(&mut output, b'=', marker_size, b"");
-    append_version(&mut output, theirs);
-    append_marker(&mut output, b'>', marker_size, theirs_label.as_bytes());
-    output
-}
-
-fn append_marker(output: &mut Vec<u8>, marker: u8, size: u16, label: &[u8]) {
-    output.extend(std::iter::repeat_n(marker, usize::from(size)));
-    if !label.is_empty() {
-        output.push(b' ');
-        output.extend_from_slice(label);
-    }
-    output.push(b'\n');
-}
-
-fn append_version(output: &mut Vec<u8>, content: &[u8]) {
-    output.extend_from_slice(content);
-    if !content.is_empty() && !content.ends_with(b"\n") {
-        output.push(b'\n');
-    }
+    let mut writer = Writer::default();
+    writer.conflict([base, ours, theirs], marker_size, b"\n");
+    writer.text
 }
 
 #[cfg(test)]
@@ -823,8 +812,8 @@ mod tests {
             let (ours, theirs) = (random.edit(&base), random.edit(&base));
             let mut texts = [base.concat(), ours.concat(), theirs.concat()];
             if random.below(4) == 0 {
-                let side = random.below(3);
-                texts[side] = texts[side].trim_end_matches('\n').to_owned();
+                let version = random.below(3);
+                texts[version] = texts[version].trim_end_matches('\n').to_owned();
             }
             let [base, ours, theirs] = &texts;
             let versions = versions(base, ours, theirs);

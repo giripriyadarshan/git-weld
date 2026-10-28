@@ -22,7 +22,7 @@ use std::{collections::BTreeMap, fmt, net::IpAddr, time::Duration};
 // state, such as `chunks[0]`; see `SemanticState` for its fields.
 fn instructions(chunk: &str) -> String {
     format!(
-        "`{chunk}` is one chunk of whole code items that two branches of a merge changed in \
+        "`{chunk}` is one chunk of whole code items that two sides of a merge changed in \
          different ways. Which version of it should the merged file contain?"
     )
 }
@@ -106,41 +106,16 @@ impl JevProvider {
     /// hosts, such as a local test server, so the key never travels in clear
     /// text.
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Result<Self, ProviderError> {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
-            return Err(config(format!("{} is empty", Self::API_KEY_ENV)));
-        }
-        if !api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
-            return Err(config(format!(
-                "{} must be printable ASCII without spaces",
-                Self::API_KEY_ENV
-            )));
-        }
-        let mut authorization = HeaderValue::try_from(format!("Bearer {api_key}"))
-            .map_err(|_| config(format!("{} is not a valid header value", Self::API_KEY_ENV)))?;
-        authorization.set_sensitive(true);
-
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(config(format!("{} is empty", Self::MODEL_ENV)));
-        }
+        let authorization = bearer_header(Self::API_KEY_ENV, api_key)?;
+        let model = trim_model(Self::MODEL_ENV, model)?;
         let endpoint = endpoint(base_url)?;
-        let mut client = Client::builder().user_agent(USER_AGENT);
-        if is_loopback(&endpoint) {
-            client = client.no_proxy();
-        }
-        let client = client.build().map_err(|error| {
-            config(format!(
-                "cannot create an HTTP client: {}",
-                error_chain(&error)
-            ))
-        })?;
+        let client = http_client(&endpoint)?;
 
         Ok(Self {
             client,
             endpoint,
             authorization,
-            model: model.to_owned(),
+            model,
             retry: Retry::default(),
         })
     }
@@ -350,6 +325,44 @@ pub(super) async fn send_request(
 
 pub(super) fn config(message: String) -> ProviderError {
     ProviderError::Config(message)
+}
+
+pub(super) fn trim_model(env_name: &str, model: &str) -> Result<String, ProviderError> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(config(format!("{env_name} is empty")));
+    }
+    Ok(model.to_owned())
+}
+
+pub(super) fn bearer_header(env_name: &str, api_key: &str) -> Result<HeaderValue, ProviderError> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err(config(format!("{env_name} is empty")));
+    }
+    if !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(config(format!(
+            "{env_name} must be printable ASCII without spaces"
+        )));
+    }
+    let header_text = ["Bearer ", key].concat();
+    let mut value = HeaderValue::try_from(header_text)
+        .map_err(|_| config(format!("{env_name} is not a valid header value")))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+pub(super) fn http_client(endpoint: &Url) -> Result<Client, ProviderError> {
+    let mut client = Client::builder().user_agent(USER_AGENT);
+    if is_loopback(endpoint) {
+        client = client.no_proxy();
+    }
+    client.build().map_err(|error| {
+        config(format!(
+            "cannot create an HTTP client: {}",
+            error_chain(&error)
+        ))
+    })
 }
 
 fn invalid(message: String) -> ProviderError {
@@ -612,7 +625,7 @@ mod tests {
         })
     }
 
-    fn response(answers: Value) -> Vec<u8> {
+    fn response(answers: &Value) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "model": "jev-1.13.0",
             "answers": answers,
@@ -636,7 +649,7 @@ mod tests {
                 "chunk_0": {
                     "type": "choice",
                     "instructions": "`chunks[0]` is one chunk of whole code items that two \
-                                     branches of a merge changed in different ways. Which \
+                                     sides of a merge changed in different ways. Which \
                                      version of it should the merged file contain?",
                     "criteria": {
                         "Manual": criterion(MergeAction::Manual, "chunks[0]"),
@@ -719,7 +732,7 @@ mod tests {
 
     #[test]
     fn turns_choice_answers_into_decisions() {
-        let body = response(json!({
+        let body = response(&json!({
             "chunk_0": answer("TakeTheirs", 0.97, [0.01, 0.01, 0.98]),
             "chunk_1": answer("Manual", 0.4, [0.6, 0.3, 0.1]),
         }));
@@ -751,12 +764,12 @@ mod tests {
         let with = |field: &str, value: Value| {
             let mut answer = valid.clone();
             answer[field] = value;
-            response(json!({ "chunk_0": answer }))
+            response(&json!({ "chunk_0": answer }))
         };
         let without = |field: &str| {
             let mut answer = valid.clone();
             answer.as_object_mut().unwrap().remove(field);
-            response(json!({ "chunk_0": answer }))
+            response(&json!({ "chunk_0": answer }))
         };
 
         for (body, message) in [
@@ -765,9 +778,9 @@ mod tests {
                 serde_json::to_vec(&json!({"answers": {}})).unwrap(),
                 "missing field `model` at line 1 column 14",
             ),
-            (response(json!({})), "answers.chunk_0 is missing"),
+            (response(&json!({})), "answers.chunk_0 is missing"),
             (
-                response(json!({"chunk_0": {"type": "noul", "noul": 0.9}})),
+                response(&json!({"chunk_0": {"type": "noul", "noul": 0.9}})),
                 "answers.chunk_0.type is `noul`, expected `choice`",
             ),
             (

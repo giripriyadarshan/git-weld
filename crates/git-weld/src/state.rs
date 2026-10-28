@@ -3,9 +3,9 @@
 //! as JSON ([`Serialize`]).
 
 use crate::{
-    ast::{Analysis, Language, Outline, OutlineItem, Segment},
+    ast::{Analysis, Language, Outline, OutlineItem, Segment, dedent},
     chunk::{Chunk, ChunkItem},
-    merge::{LineMerge, Version as MergeVersion},
+    merge::{LineMerge, Version},
 };
 use serde::Serialize;
 use similar::TextDiff;
@@ -51,7 +51,7 @@ pub struct SignatureState {
 }
 
 /// One chunk: whole items that both sides changed. A missing version (`null`
-/// in JSON) means the chunk is empty on that side: its items were added on
+/// in JSON) means the chunk is empty in that version: its items were added on
 /// both sides or deleted on one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChunkState {
@@ -60,13 +60,13 @@ pub struct ChunkState {
     pub items: Vec<String>,
     /// One neutral sentence per version saying what happened to the chunk.
     pub summary: String,
-    pub base: Option<Version>,
-    pub ours: Option<Version>,
-    pub theirs: Option<Version>,
+    pub base: Option<VersionState>,
+    pub ours: Option<VersionState>,
+    pub theirs: Option<VersionState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Version {
+pub struct VersionState {
     #[serde(skip)]
     pub lines: RangeInclusive<usize>,
     /// The chunk's code, including comments, attributes, and decorators,
@@ -139,7 +139,7 @@ fn hoist_signatures(
     merge: &LineMerge,
     chunks: &[&Chunk],
 ) -> Vec<SignatureState> {
-    let outlines = MergeVersion::ALL.map(|version| analysis.outline(version));
+    let outlines = Version::ALL.map(|version| analysis.outline(version));
     let by_key: [HashMap<&[Segment], &OutlineItem>; 3] = outlines.map(|outline| {
         outline
             .items()
@@ -168,7 +168,7 @@ fn hoist_signatures(
         let mut covered: HashSet<&[Segment]> = HashSet::new();
         let mut names: HashSet<&str> = HashSet::new();
 
-        for version in MergeVersion::ALL {
+        for version in Version::ALL {
             let outline = analysis.outline(version);
             let span = merge.bytes(version, chunk.lines(merge, version));
             for name in outline.referenced_names(span.clone()) {
@@ -179,7 +179,12 @@ fn hoist_signatures(
                     && !item.bytes.is_empty()
                     && span.start <= item.bytes.start
                     && item.bytes.end <= span.end;
-                if inside_span || chunk_paths.contains(&item.path) {
+                let encloses_span = item.container
+                    && !span.is_empty()
+                    && !item.bytes.is_empty()
+                    && item.bytes.start <= span.start
+                    && span.end <= item.bytes.end;
+                if inside_span || encloses_span || chunk_paths.contains(&item.path) {
                     covered.insert(item.key.as_slice());
                 }
             }
@@ -193,8 +198,8 @@ fn hoist_signatures(
             .copied()
             .filter(|&key| !covered.contains(key))
             .filter(|&key| {
-                by_key.iter().any(|side_map| {
-                    side_map.get(key).is_some_and(|item| {
+                by_key.iter().any(|version_map| {
+                    version_map.get(key).is_some_and(|item| {
                         item.signature.is_some()
                             && item
                                 .name
@@ -206,16 +211,17 @@ fn hoist_signatures(
             .collect();
 
         for &key in &matched {
-            let parent_already_hoisted = by_key.iter().zip(outlines).any(|(side_map, outline)| {
-                side_map
-                    .get(key)
-                    .and_then(|item| item.parent)
-                    .filter(|&parent| parent != Outline::ROOT)
-                    .map(|parent| outline.item(parent))
-                    .is_some_and(|parent| {
-                        parent.signature.is_some() && matched.contains(parent.key.as_slice())
-                    })
-            });
+            let parent_already_hoisted =
+                by_key.iter().zip(outlines).any(|(version_map, outline)| {
+                    version_map
+                        .get(key)
+                        .and_then(|item| item.parent)
+                        .filter(|&parent| parent != Outline::ROOT)
+                        .map(|parent| outline.item(parent))
+                        .is_some_and(|parent| {
+                            parent.signature.is_some() && matched.contains(parent.key.as_slice())
+                        })
+                });
             if !parent_already_hoisted {
                 referencing.entry(key).or_default().push(chunk_index);
             }
@@ -226,9 +232,9 @@ fn hoist_signatures(
         .into_iter()
         .filter_map(|key| {
             let chunks = referencing.remove(key)?;
-            let base_item = by_key[MergeVersion::Base as usize].get(key).copied();
-            let ours_item = by_key[MergeVersion::Ours as usize].get(key).copied();
-            let theirs_item = by_key[MergeVersion::Theirs as usize].get(key).copied();
+            let base_item = by_key[Version::Base as usize].get(key).copied();
+            let ours_item = by_key[Version::Ours as usize].get(key).copied();
+            let theirs_item = by_key[Version::Theirs as usize].get(key).copied();
             let item = ours_item
                 .or(theirs_item)
                 .or(base_item)
@@ -261,15 +267,12 @@ fn hoist_signatures(
 
 impl ChunkState {
     fn new(merge: &LineMerge, chunk: &Chunk) -> Self {
-        let base = Version::new(merge, chunk, MergeVersion::Base, None);
-        let ours = Version::new(merge, chunk, MergeVersion::Ours, base.as_ref());
-        let theirs = Version::new(merge, chunk, MergeVersion::Theirs, base.as_ref());
+        let base = VersionState::new(merge, chunk, Version::Base, None);
+        let ours = VersionState::new(merge, chunk, Version::Ours, base.as_ref());
+        let theirs = VersionState::new(merge, chunk, Version::Theirs, base.as_ref());
         let present = [base.is_some(), ours.is_some(), theirs.is_some()];
         Self {
-            summary: summary(
-                MergeVersion::ALL.map(|version| chunk.items(version)),
-                present,
-            ),
+            summary: summary(Version::ALL.map(|version| chunk.items(version)), present),
             items: chunk.item_paths(),
             base,
             ours,
@@ -278,12 +281,12 @@ impl ChunkState {
     }
 }
 
-impl Version {
+impl VersionState {
     fn new(
         merge: &LineMerge,
         chunk: &Chunk,
-        version: MergeVersion,
-        base: Option<&Version>,
+        version: Version,
+        base: Option<&VersionState>,
     ) -> Option<Self> {
         let lines = chunk.lines(merge, version);
         let blank = |line: usize| {
@@ -314,13 +317,13 @@ fn summary(items: [&[ChunkItem]; 3], present: [bool; 3]) -> String {
         items.iter().map(|item| item.path.as_str()).collect()
     }
     let mut versions = (0..3)
-        .filter(|&side| present[side])
-        .map(|side| paths(items[side]));
+        .filter(|&version| present[version])
+        .map(|version| paths(items[version]));
     let first = versions.next().unwrap_or_default();
     if first.is_empty() || versions.any(|other| other != first) {
-        let list = |side: usize| {
-            if present[side] && !items[side].is_empty() {
-                listing(items[side], |item| {
+        let list = |version: usize| {
+            if present[version] && !items[version].is_empty() {
+                listing(items[version], |item| {
                     format!("`{}` (`{}`)", item.path, item.node_kind)
                 })
             } else {
@@ -335,7 +338,7 @@ fn summary(items: [&[ChunkItem]; 3], present: [bool; 3]) -> String {
         );
     }
 
-    let subject = items[(0..3).find(|&side| present[side]).unwrap_or_default()];
+    let subject = items[(0..3).find(|&version| present[version]).unwrap_or_default()];
     let plural = subject.len() > 1;
     let it = if plural { "them" } else { "it" };
     let base = match (present[0], plural) {
@@ -372,33 +375,6 @@ fn listing(items: &[ChunkItem], describe: impl Fn(&ChunkItem) -> String) -> Stri
     }
 }
 
-fn dedent(text: &str) -> String {
-    let indentation = |line: &str| {
-        let content = line.trim_start_matches([' ', '\t']);
-        line.len() - content.len()
-    };
-    let common = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| &line[..indentation(line)])
-        .reduce(|common, indent| {
-            let shared = common
-                .bytes()
-                .zip(indent.bytes())
-                .take_while(|(left, right)| left == right)
-                .count();
-            &common[..shared]
-        })
-        .unwrap_or_default();
-    text.lines()
-        .map(|line| {
-            line.strip_prefix(common)
-                .unwrap_or_else(|| line.trim_start_matches([' ', '\t']))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn diff(old: &str, new: &str) -> String {
     let (old, new) = (format!("{old}\n"), format!("{new}\n"));
     let diff = TextDiff::from_lines(&old, &new);
@@ -425,24 +401,24 @@ impl fmt::Display for SemanticState {
                 index + 1,
                 chunk.summary
             )?;
-            for (side, version) in [
+            for (label, version) in [
                 ("Base", &chunk.base),
                 ("Ours", &chunk.ours),
                 ("Theirs", &chunk.theirs),
             ] {
                 let Some(version) = version else {
-                    writeln!(formatter, "{side}: not present")?;
+                    writeln!(formatter, "{label}: not present")?;
                     continue;
                 };
                 let (first, last) = (version.lines.start(), version.lines.end());
                 if first == last {
-                    writeln!(formatter, "{side}, line {first}:")?;
+                    writeln!(formatter, "{label}, line {first}:")?;
                 } else {
-                    writeln!(formatter, "{side}, lines {first}-{last}:")?;
+                    writeln!(formatter, "{label}, lines {first}-{last}:")?;
                 }
                 write_indented(formatter, &version.code)?;
                 if let Some(changes) = &version.changes {
-                    writeln!(formatter, "{side} changes from base:")?;
+                    writeln!(formatter, "{label} changes from base:")?;
                     write_indented(formatter, changes)?;
                 }
             }
@@ -453,17 +429,17 @@ impl fmt::Display for SemanticState {
             if let Some(code) = &signature.signature {
                 write_indented(formatter, code)?;
             } else {
-                for (side, version) in [
+                for (label, version) in [
                     ("Base", &signature.base),
                     ("Ours", &signature.ours),
                     ("Theirs", &signature.theirs),
                 ] {
                     match version {
                         Some(code) => {
-                            writeln!(formatter, "{side}:")?;
+                            writeln!(formatter, "{label}:")?;
                             write_indented(formatter, code)?;
                         }
-                        None => writeln!(formatter, "{side}: not present")?,
+                        None => writeln!(formatter, "{label}: not present")?,
                     }
                 }
             }
@@ -626,7 +602,7 @@ Theirs changes from base:
         assert_eq!(chunk.base, None);
         assert_eq!(
             chunk.ours,
-            Some(Version {
+            Some(VersionState {
                 lines: 5..=6,
                 code: "def gamma():\n    return 3".to_owned(),
                 changes: None,
@@ -843,6 +819,85 @@ fn second(user: &User) -> u32 {
              Referenced signature `fn helper`:\n    \
              /// Doubles `value`.\n    fn helper(value: u32) -> u32\n"
         ));
+    }
+
+    #[test]
+    fn hoists_referenced_rust_impl_mod_and_extern_container_signatures() {
+        let base = "\
+struct Counter {
+    value: u32,
+}
+
+impl Counter {
+    fn step(&self) -> u32 {
+        self.value + 1
+    }
+}
+
+mod math {
+    pub const SCALE: u32 = 2;
+    pub fn scale(x: u32) -> u32 {
+        x * SCALE
+    }
+}
+
+extern \"C\" {
+    fn c_hash(x: u32) -> u32;
+}
+
+fn compute(counter: &Counter) -> u32 {
+    unsafe { c_hash(math::scale(counter.step())) }
+}
+";
+        let ours = base.replace("math::scale(counter.step())", "math::scale(counter.value)");
+        let theirs = base.replace(
+            "math::scale(counter.step())",
+            "math::scale(counter.step() + 1)",
+        );
+
+        let state = state("src/lib.rs", base, &ours, &theirs);
+
+        assert_eq!(
+            state.signatures,
+            [
+                SignatureState {
+                    item: "struct Counter".to_owned(),
+                    signature: Some("struct Counter {\n    value: u32,\n}".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "impl Counter".to_owned(),
+                    signature: Some("impl Counter {\n    fn step(&self) -> u32;\n}".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "mod math".to_owned(),
+                    signature: Some(
+                        "mod math {\n    pub const SCALE: u32 = 2;\n    \
+                         pub fn scale(x: u32) -> u32;\n}"
+                            .to_owned()
+                    ),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "extern \"C\" > fn c_hash".to_owned(),
+                    signature: Some("fn c_hash(x: u32) -> u32;".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+            ]
+        );
     }
 
     #[test]

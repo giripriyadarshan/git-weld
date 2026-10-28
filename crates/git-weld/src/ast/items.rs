@@ -530,7 +530,7 @@ fn write_node(
                             continue;
                         }
                         let frame = frames.pop().expect("the frame was just pushed");
-                        close_frame(output, language, source, frame);
+                        close_frame(output, language, source, &frame);
                     }
                 }
             }
@@ -542,7 +542,7 @@ fn write_node(
                 break;
             }
             let frame = frames.pop().expect("every open node has a frame");
-            close_frame(output, language, source, frame);
+            close_frame(output, language, source, &frame);
             if frames.is_empty() {
                 return;
             }
@@ -551,9 +551,9 @@ fn write_node(
     }
 }
 
-fn close_frame(output: &mut String, language: Language, source: &str, frame: Frame) {
+fn close_frame(output: &mut String, language: Language, source: &str, frame: &Frame) {
     if let Some(pending) = &frame.pending {
-        if !trailing_comma_is_optional(language, &frame) {
+        if !trailing_comma_is_optional(language, frame) {
             write_comma(output);
         }
         output.push_str(pending);
@@ -837,10 +837,15 @@ fn extract_rust_signature(
     start_byte: usize,
     node: Node,
 ) -> (Option<String>, Option<String>) {
-    let item_name = node
-        .child_by_field_name("name")
-        .map(|n| text(source, n).into_owned())
-        .filter(|s| !s.is_empty());
+    let item_name = match node.kind() {
+        "impl_item" => node
+            .child_by_field_name("type")
+            .and_then(|ty| first_type_identifier(source, ty)),
+        _ => node
+            .child_by_field_name("name")
+            .map(|n| text(source, n).into_owned())
+            .filter(|s| !s.is_empty()),
+    };
 
     let signature = match node.kind() {
         "function_item" => {
@@ -857,14 +862,16 @@ fn extract_rust_signature(
         | "associated_type"
         | "const_item"
         | "static_item" => Some(slice_signature(source, start_byte..node.end_byte())),
-        "trait_item" => Some(rust_trait_signature(source, start_byte, node)),
+        "trait_item" | "impl_item" | "mod_item" | "foreign_mod_item" => {
+            Some(rust_container_signature(source, start_byte, node))
+        }
         _ => None,
     };
 
     (item_name, signature.filter(|s| !s.is_empty()))
 }
 
-fn rust_trait_signature(source: &str, start_byte: usize, node: Node) -> String {
+fn rust_container_signature(source: &str, start_byte: usize, node: Node) -> String {
     let Some(body) = node.child_by_field_name("body") else {
         return slice_signature(source, start_byte..node.end_byte());
     };
@@ -887,9 +894,14 @@ fn rust_trait_signature(source: &str, start_byte: usize, node: Node) -> String {
                     .map_or(child.end_byte(), |block| block.start_byte());
                 format!("{};", slice_signature(source, member_start..end))
             }
-            "function_signature_item" | "associated_type" | "const_item" => {
-                slice_signature(source, member_start..child.end_byte())
-            }
+            "function_signature_item"
+            | "associated_type"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item" => slice_signature(source, member_start..child.end_byte()),
             _ => continue,
         };
         if !member.is_empty() {
@@ -1005,10 +1017,10 @@ fn slice_signature(source: &str, bytes: Range<usize>) -> String {
         .get(start..bytes.end)
         .unwrap_or_default()
         .replace("\r\n", "\n");
-    dedent_signature(raw.trim_end())
+    dedent(raw.trim_end())
 }
 
-fn dedent_signature(text: &str) -> String {
+pub(crate) fn dedent(text: &str) -> String {
     let indentation = |line: &str| {
         let content = line.trim_start_matches([' ', '\t']);
         line.len() - content.len()

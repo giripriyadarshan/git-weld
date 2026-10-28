@@ -86,6 +86,7 @@ struct Cli {
     #[arg(
         long,
         env = "WELD_NO_CACHE",
+        value_parser = parse_no_cache,
         help = "Bypass the decision cache in .git/git-weld/cache"
     )]
     no_cache: bool,
@@ -200,6 +201,14 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
         return Err("the timeout must be more than 0 and at most 3600 seconds".to_owned());
     }
     Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_no_cache(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(format!("`{value}` is not a valid boolean")),
+    }
 }
 
 // A clean merge only needs AST analysis when both sides changed the file
@@ -405,6 +414,7 @@ fn evaluate_misses(
     let evaluation = panic::catch_unwind(AssertUnwindSafe(|| {
         runtime.block_on(provider::evaluate(provider, state, timeout))
     }));
+    runtime.shutdown_background();
     match evaluation {
         Ok(Ok(decisions)) => Some(decisions),
         Ok(Err(error)) => {
@@ -440,8 +450,8 @@ fn spans(chunks: &[Chunk], takes: &[Option<Version>]) -> Vec<Span> {
         .collect()
 }
 
-// The resolved chunks must fit the code around them. Conflicts that stay
-// manual are filled with our side for the check, since markers never parse.
+// The resolved chunks must fit the code around them. Chunks left for manual
+// resolution are filled with our side for the check, since markers never parse.
 fn check_stitched(
     analysis: &Analysis,
     merge: &LineMerge,
