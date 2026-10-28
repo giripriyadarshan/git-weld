@@ -1,0 +1,3 @@
+# Hoist referenced signatures only from the merged file
+
+When building the semantic state for a chunk, `git-weld` hoists the signatures of referenced types, traits, classes, and functions only from the three versions of the file being merged (`%O`, `%A`, and `%B`), never from other files in the repository. Git passes custom merge drivers only the three temporary file paths and human-readable conflict labels (`%S`, `%X`, `%Y`) rather than commit or tree OIDs across `git merge`, `git rebase`, `git cherry-pick`, and `git stash pop`, and the driver can also be invoked outside a Git repository. Staying within the three input files keeps every run self-contained, deterministic, and independent of working-tree or repository state.
