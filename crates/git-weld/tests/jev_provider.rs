@@ -1,8 +1,8 @@
 mod support;
 
 use git_weld::{
-    ast,
-    merge::Versions,
+    ast, chunk,
+    merge::{LineMerge, Versions},
     provider::{self, Confidence, Decision, JevProvider, MergeAction, ProviderError},
     state::SemanticState,
 };
@@ -21,8 +21,11 @@ fn state() -> SemanticState {
         theirs: base.replace("    1\n", "    100\n").into_bytes(),
     };
     let path = Path::new("src/lib.rs");
+    let merge = LineMerge::new(&versions).unwrap();
     let analysis = ast::analyze(path, &versions.base, &versions.ours, &versions.theirs).unwrap();
-    SemanticState::new(path, &analysis, &versions)
+    let chunks = chunk::chunks(&merge, Some(&analysis));
+    let chunks: Vec<_> = chunks.iter().collect();
+    SemanticState::new(path, &analysis, &merge, &chunks)
 }
 
 fn jev(url: &str) -> JevProvider {
@@ -35,7 +38,7 @@ fn answer(choice: &str, confidence: f64) -> String {
     json!({
         "model": "jev-1.13.0",
         "answers": {
-            "conflict_0": {
+            "chunk_0": {
                 "type": "choice",
                 "choice": choice,
                 "confidence": confidence,
@@ -52,7 +55,7 @@ async fn evaluate(jev: &JevProvider) -> Result<Vec<Decision>, ProviderError> {
 }
 
 #[tokio::test]
-async fn posts_the_state_with_one_question_per_conflict_and_returns_decisions() {
+async fn posts_the_state_with_one_question_per_chunk_and_returns_decisions() {
     let server = Server::start(vec![Response::new(200, answer("TakeTheirs", 0.97))]);
 
     let decisions = evaluate(&jev(&server.url())).await.unwrap();
@@ -82,7 +85,7 @@ async fn posts_the_state_with_one_question_per_conflict_and_returns_decisions() 
     assert_eq!(body["model"], "jev-latest");
     assert_eq!(body["state"], serde_json::to_value(state()).unwrap());
     assert_eq!(body["questions"].as_object().unwrap().len(), 1);
-    assert_eq!(body["questions"]["conflict_0"]["type"], "choice");
+    assert_eq!(body["questions"]["chunk_0"]["type"], "choice");
 }
 
 #[tokio::test]
@@ -175,9 +178,9 @@ async fn rejects_answers_outside_the_schema() {
     assert_eq!(
         errors,
         [
-            "invalid response: answers.conflict_0.choice: unknown decision `TakeBoth` \
+            "invalid response: answers.chunk_0.choice: unknown decision `TakeBoth` \
              (expected TakeOurs, TakeTheirs, or Manual)",
-            "invalid response: answers.conflict_0.confidence: \
+            "invalid response: answers.chunk_0.confidence: \
              confidence 1.5 is not between 0 and 1",
             "invalid response: expected value at line 1 column 1",
         ]

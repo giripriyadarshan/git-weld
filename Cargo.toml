@@ -12,11 +12,26 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 jsonschema = { version = "0.58", default-features = false }
 reqwest = "0.13"
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-similar = "3"
+sha2 = "0.11"
+similar = { version = "3", features = ["bytes"] }
 tempfile = "3"
 tokio = "1"
 tree-sitter = "0.27"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+inconsistent_struct_constructor = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unnested_or_patterns = "warn"

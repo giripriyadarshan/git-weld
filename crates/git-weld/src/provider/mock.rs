@@ -6,8 +6,8 @@ use crate::state::SemanticState;
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// Answers every conflict with the decision in its JSON configuration: one
-/// decision object for every item, or an array with one decision per item.
+/// Answers every chunk with the decision in its JSON configuration: one
+/// decision object for every chunk, or an array with one decision per chunk.
 /// The JSON is validated like a real provider's answer, on every evaluation.
 #[derive(Clone, Debug)]
 pub struct MockProvider {
@@ -39,11 +39,11 @@ impl SystemOneProvider for MockProvider {
 
     async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
         let invalid = |error: serde_json::Error| ProviderError::InvalidResponse(error.to_string());
-        let count = state.conflicts.len();
+        let count = state.chunks.len();
         match serde_json::from_str(&self.answer).map_err(invalid)? {
             Value::Array(answers) if answers.len() != count => {
                 Err(ProviderError::InvalidResponse(format!(
-                    "{}: decision count {} does not match conflicting item count {count}",
+                    "{}: decision count {} does not match chunk count {count}",
                     Self::ENV,
                     answers.len()
                 )))
@@ -66,23 +66,23 @@ mod tests {
     use crate::{
         ast::Language,
         provider::{Confidence, MergeAction},
-        state::ConflictState,
+        state::ChunkState,
     };
 
-    fn state(conflicts: usize) -> SemanticState {
+    fn state(chunks: usize) -> SemanticState {
         SemanticState {
             file: "lib.rs".to_owned(),
             language: Language::Rust,
-            conflicts: (0..conflicts)
-                .map(|index| ConflictState {
-                    item: format!("fn item{index}"),
-                    node_type: "function_item".to_owned(),
+            chunks: (0..chunks)
+                .map(|index| ChunkState {
+                    items: vec![format!("fn item{index}")],
                     summary: String::new(),
                     base: None,
                     ours: None,
                     theirs: None,
                 })
                 .collect(),
+            signatures: Vec::new(),
         }
     }
 
@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answers_every_conflict_with_one_decision() {
+    async fn answers_every_chunk_with_one_decision() {
         let mock = MockProvider::new(
             r#"{"decision": "TakeTheirs", "confidence": 0.99, "reason": "theirs wins"}"#,
         );
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answers_each_conflict_from_an_array() {
+    async fn answers_each_chunk_from_an_array() {
         let mock = MockProvider::new(
             r#"[
                 {"decision": "TakeOurs", "confidence": 1, "reason": "a"},
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(
             mock.evaluate(&state(3)).await.unwrap_err().to_string(),
             "invalid response: WELD_MOCK_DECISION: decision count 2 does not match \
-             conflicting item count 3"
+             chunk count 3"
         );
     }
 

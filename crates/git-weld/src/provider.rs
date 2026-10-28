@@ -4,9 +4,11 @@
 
 mod jev;
 mod mock;
+mod ollama;
 
 pub use jev::JevProvider;
 pub use mock::MockProvider;
+pub use ollama::OllamaProvider;
 
 use crate::state::SemanticState;
 use async_trait::async_trait;
@@ -17,7 +19,7 @@ use serde::{
 use serde_json::{Value, json};
 use std::{error::Error, fmt, str::FromStr, time::Duration};
 
-/// A decision may resolve its item without a person only when its confidence
+/// A decision may resolve its chunk without a person only when its confidence
 /// is strictly greater than this. A confidence of exactly 0.95 does not.
 pub const AUTO_RESOLVE_THRESHOLD: f64 = 0.95;
 
@@ -25,19 +27,24 @@ pub const AUTO_RESOLVE_THRESHOLD: f64 = 0.95;
 pub const MANUAL: &str = "manual";
 
 /// Every name that [`load`] accepts.
-pub const PROVIDERS: [&str; 3] = [JevProvider::NAME, MANUAL, MockProvider::NAME];
+pub const PROVIDERS: [&str; 4] = [
+    JevProvider::NAME,
+    MANUAL,
+    MockProvider::NAME,
+    OllamaProvider::NAME,
+];
 
 /// Looks up configuration such as API keys; `std::env::var` in the driver.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// What to do with one item that both sides changed.
+/// What to do with one chunk that both sides changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MergeAction {
-    /// Keep our version of the item.
+    /// Keep our version of the chunk.
     TakeOurs,
-    /// Keep their version of the item.
+    /// Keep their version of the chunk.
     TakeTheirs,
-    /// Neither version alone is right, so a person must merge the item.
+    /// Neither version alone is right, so a person must merge the chunk.
     Manual,
 }
 
@@ -135,7 +142,7 @@ impl fmt::Display for InvalidConfidence {
 
 impl Error for InvalidConfidence {}
 
-/// The uniform answer for one conflicting item, whatever the backend:
+/// The uniform answer for one chunk, whatever the backend:
 /// `{"decision": "TakeOurs", "confidence": 0.98, "reason": "..."}`.
 ///
 /// Deserializing enforces [`Decision::json_schema`]: only objects are
@@ -198,11 +205,11 @@ impl Decision {
         json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "Decision",
-            "description": "How to resolve one item that both sides of a merge changed.",
+            "description": "How to resolve one chunk of code that both sides of a merge changed.",
             "type": "object",
             "properties": {
                 "decision": {
-                    "description": "Keep our version, keep their version, or leave the item to a person.",
+                    "description": "Keep our version, keep their version, or leave the chunk to a person.",
                     "type": "string",
                     "enum": MergeAction::ALL.map(MergeAction::as_str),
                 },
@@ -222,7 +229,7 @@ impl Decision {
         })
     }
 
-    /// Whether the decision is confident enough to resolve its item without
+    /// Whether the decision is confident enough to resolve its chunk without
     /// a person: `TakeOurs` or `TakeTheirs` above [`AUTO_RESOLVE_THRESHOLD`].
     pub fn is_auto_resolvable(&self) -> bool {
         self.decision != MergeAction::Manual && self.confidence.value() > AUTO_RESOLVE_THRESHOLD
@@ -267,7 +274,7 @@ impl fmt::Display for ProviderError {
 
 impl Error for ProviderError {}
 
-/// A System One backend that decides how to resolve conflicting items.
+/// A System One backend that decides how to resolve conflicting chunks.
 ///
 /// Implementations are used as `Box<dyn SystemOneProvider>`, so they are
 /// written with `#[async_trait]`.
@@ -276,28 +283,42 @@ pub trait SystemOneProvider: Send + Sync {
     /// The name that selects this provider, such as `jev`.
     fn name(&self) -> &str;
 
-    /// Returns one decision per entry of `state.conflicts`, in the same order.
+    /// Identifies the provider, configured model, and prompt revision for the
+    /// decision cache. Returning `None` disables caching for this provider.
+    fn cache_key(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether `state` only fits within the provider's request size limit by
+    /// trimming hoisted signatures.
+    fn would_trim(&self, _state: &SemanticState) -> bool {
+        false
+    }
+
+    /// Returns one decision per entry of `state.chunks`, in the same order.
+    /// A backend that cannot batch questions may ask about the chunks
+    /// concurrently.
     async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError>;
 }
 
-/// Asks `provider` about every conflict in `state`, giving up after
-/// `timeout`, and checks that it answered each conflict exactly once.
+/// Asks `provider` about every chunk in `state`, giving up after `timeout`,
+/// and checks that it answered each chunk exactly once.
 pub async fn evaluate(
     provider: &dyn SystemOneProvider,
     state: &SemanticState,
     timeout: Duration,
 ) -> Result<Vec<Decision>, ProviderError> {
-    if state.conflicts.is_empty() {
+    if state.chunks.is_empty() {
         return Ok(Vec::new());
     }
     let decisions = tokio::time::timeout(timeout, provider.evaluate(state))
         .await
         .map_err(|_| ProviderError::Timeout(timeout))??;
-    if decisions.len() != state.conflicts.len() {
+    if decisions.len() != state.chunks.len() {
         return Err(ProviderError::InvalidResponse(format!(
-            "decision count {} does not match conflicting item count {}",
+            "decision count {} does not match chunk count {}",
             decisions.len(),
-            state.conflicts.len()
+            state.chunks.len()
         )));
     }
     Ok(decisions)
@@ -347,6 +368,8 @@ pub fn load(name: &str, env: Env) -> Result<Option<Box<dyn SystemOneProvider>>, 
         boxed(JevProvider::NAME, JevProvider::from_env(env))
     } else if name.eq_ignore_ascii_case(MockProvider::NAME) {
         boxed(MockProvider::NAME, MockProvider::from_env(env))
+    } else if name.eq_ignore_ascii_case(OllamaProvider::NAME) {
+        boxed(OllamaProvider::NAME, OllamaProvider::from_env(env))
     } else {
         Err(LoadError::Unknown(name.to_owned()))
     }
@@ -370,27 +393,27 @@ fn error_chain(error: &dyn Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ast::Language, state::ConflictState};
+    use crate::{ast::Language, state::ChunkState};
     use std::collections::HashMap;
 
     fn confidence(value: f64) -> Confidence {
         Confidence::new(value).unwrap()
     }
 
-    fn state(conflicts: usize) -> SemanticState {
+    fn state(chunks: usize) -> SemanticState {
         SemanticState {
             file: "src/lib.rs".to_owned(),
             language: Language::Rust,
-            conflicts: (0..conflicts)
-                .map(|index| ConflictState {
-                    item: format!("fn item{index}"),
-                    node_type: "function_item".to_owned(),
+            chunks: (0..chunks)
+                .map(|index| ChunkState {
+                    items: vec![format!("fn item{index}")],
                     summary: String::new(),
                     base: None,
                     ours: None,
                     theirs: None,
                 })
                 .collect(),
+            signatures: Vec::new(),
         }
     }
 
@@ -583,7 +606,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "invalid response: decision count 1 does not match conflicting item count 2"
+            "invalid response: decision count 1 does not match chunk count 2"
         );
         assert_eq!(
             evaluate(&Slow, &state(0), Duration::from_millis(1)).await,
@@ -605,6 +628,7 @@ mod tests {
     fn loads_providers_by_name() {
         let configured = env(&[
             ("TYPESAFE_API_KEY", "ts-key"),
+            ("OLLAMA_MODEL", "kev:0.8b-bf16"),
             (
                 MockProvider::ENV,
                 r#"{"decision": "Manual", "confidence": 1, "reason": ""}"#,
@@ -617,6 +641,14 @@ mod tests {
         assert_eq!(load("jev", &configured).unwrap().unwrap().name(), "jev");
         assert_eq!(load("JEV", &configured).unwrap().unwrap().name(), "jev");
         assert_eq!(load("mock", &configured).unwrap().unwrap().name(), "mock");
+        assert_eq!(
+            load("ollama", &configured).unwrap().unwrap().name(),
+            "ollama"
+        );
+        assert_eq!(
+            load("OLLAMA", &configured).unwrap().unwrap().name(),
+            "ollama"
+        );
 
         let error = load("jev", &empty).err().unwrap();
         assert_eq!(
@@ -628,12 +660,17 @@ mod tests {
             error.to_string(),
             "provider mock is unavailable: WELD_MOCK_DECISION is not set"
         );
+        let error = load("ollama", &empty).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "provider ollama is unavailable: OLLAMA_MODEL is not set"
+        );
         for name in ["clef", "sap-rst", "jev2"] {
             let error = load(name, &configured).err().unwrap();
             assert_eq!(error, LoadError::Unknown(name.to_owned()));
             assert_eq!(
                 error.to_string(),
-                format!("unknown provider `{name}` (available: jev, manual, mock)")
+                format!("unknown provider `{name}` (available: jev, manual, mock, ollama)")
             );
         }
     }

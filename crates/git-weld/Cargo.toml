@@ -10,8 +10,10 @@ anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 similar.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
@@ -22,3 +24,6 @@ tree-sitter-rust.workspace = true
 [dev-dependencies]
 jsonschema.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+
+[lints]
+workspace = true

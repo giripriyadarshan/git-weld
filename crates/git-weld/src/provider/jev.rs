@@ -1,7 +1,8 @@
 //! Jev, TypeSafe AI's System One model (<https://docs.typesafe.ai>).
 //!
-//! All conflicting items of a file go out in one `POST /v1/systemone`
-//! request: the semantic state as JSON plus one Choice question per item.
+//! All chunks of a file go out in one `POST /v1/systemone` request: the
+//! semantic state as JSON plus one Choice question per chunk, which Jev
+//! evaluates in parallel against the same state.
 //! Jev answers each question with one of our options, a probability for every
 //! option, and a calibrated confidence, so no free text needs parsing.
 
@@ -17,12 +18,12 @@ use reqwest::{
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::{collections::BTreeMap, fmt, net::IpAddr, time::Duration};
 
-// The question asked about every conflicting item. `item` is the item's path
-// in the state, such as `conflicts[0]`; see `SemanticState` for its fields.
-fn instructions(item: &str) -> String {
+// The question asked about every chunk. `chunk` is the chunk's path in the
+// state, such as `chunks[0]`; see `SemanticState` for its fields.
+fn instructions(chunk: &str) -> String {
     format!(
-        "`{item}` is one code item that two branches of a merge changed in different ways. \
-         Which version should the merged file contain?"
+        "`{chunk}` is one chunk of whole code items that two branches of a merge changed in \
+         different ways. Which version of it should the merged file contain?"
     )
 }
 
@@ -33,30 +34,31 @@ const OPTIONS: [MergeAction; 3] = [
     MergeAction::TakeTheirs,
 ];
 
-fn criterion(option: MergeAction, item: &str) -> String {
+fn criterion(option: MergeAction, chunk: &str) -> String {
     match option {
         MergeAction::Manual => format!(
-            "Neither version alone. The merged item needs changes from both `{item}.ours` and \
-             `{item}.theirs`, the two changes contradict each other, or the right result is \
+            "Neither version alone. The merged chunk needs changes from both `{chunk}.ours` and \
+             `{chunk}.theirs`, the two changes contradict each other, or the right result is \
              unclear."
         ),
         MergeAction::TakeOurs => format!(
-            "`{item}.ours` exactly as it is (null means the item is removed). It already \
-             includes the change made in `{item}.theirs` or an equivalent one, so nothing from \
-             `{item}.theirs` is lost."
+            "`{chunk}.ours` exactly as it is (null means the chunk is removed). It already \
+             includes the change made in `{chunk}.theirs` or an equivalent one, so nothing from \
+             `{chunk}.theirs` is lost."
         ),
         MergeAction::TakeTheirs => format!(
-            "`{item}.theirs` exactly as it is (null means the item is removed). It already \
-             includes the change made in `{item}.ours` or an equivalent one, so nothing from \
-             `{item}.ours` is lost."
+            "`{chunk}.theirs` exactly as it is (null means the chunk is removed). It already \
+             includes the change made in `{chunk}.ours` or an equivalent one, so nothing from \
+             `{chunk}.ours` is lost."
         ),
     }
 }
 
 // Roughly the 32k tokens Jev 1.13 accepts for the state and one question.
-const MAX_REQUEST_BYTES: usize = 128 * 1024;
+pub(super) const MAX_REQUEST_BYTES: usize = 128 * 1024;
+pub(super) const PROMPT_REVISION: &str = "systemone-choice-v1";
 const MAX_ERROR_CHARS: usize = 200;
-const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+pub(super) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 pub struct JevProvider {
     client: Client,
@@ -67,10 +69,10 @@ pub struct JevProvider {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Retry {
-    max_retries: u32,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+pub(super) struct Retry {
+    pub(super) max_retries: u32,
+    pub(super) initial_backoff: Duration,
+    pub(super) max_backoff: Duration,
 }
 
 impl Default for Retry {
@@ -179,78 +181,19 @@ impl JevProvider {
     }
 
     fn request_body(&self, state: &SemanticState) -> Result<Vec<u8>, ProviderError> {
-        let request = Request {
-            model: &self.model,
-            state,
-            questions: Questions(state.conflicts.len()),
-        };
-        let body = serde_json::to_vec(&request).map_err(|error| {
-            ProviderError::Transport(format!("cannot encode the request: {error}"))
-        })?;
-        if body.len() > MAX_REQUEST_BYTES {
-            return Err(ProviderError::TooLarge {
-                bytes: body.len(),
-                limit: MAX_REQUEST_BYTES,
-            });
-        }
-        Ok(body)
+        encode_request(&self.model, state).map(|(body, _)| body)
     }
 
     async fn send(&self, body: Vec<u8>) -> Result<Vec<u8>, ProviderError> {
-        let mut attempt = 0;
-        loop {
-            let sent = self
-                .client
-                .post(self.endpoint.clone())
-                .header(header::AUTHORIZATION, self.authorization.clone())
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "application/json")
-                .body(body.clone())
-                .send()
-                .await;
-            let (error, requested_wait) = match sent {
-                Ok(response) if response.status().is_success() => {
-                    return response
-                        .bytes()
-                        .await
-                        .map(|bytes| bytes.to_vec())
-                        .map_err(|error| ProviderError::Transport(error_chain(&error)));
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let wait = retry_after(response.headers());
-                    let mut message = summarize(&response.text().await.unwrap_or_default());
-                    if status == StatusCode::UNAUTHORIZED {
-                        message = format!("{message} (check {})", Self::API_KEY_ENV)
-                            .trim_start()
-                            .to_owned();
-                    }
-                    let error = ProviderError::Http {
-                        status: status.as_u16(),
-                        message,
-                    };
-                    if !is_retryable(status) {
-                        return Err(error);
-                    }
-                    (error, wait)
-                }
-                Err(error) if error.is_connect() => {
-                    (ProviderError::Transport(error_chain(&error)), None)
-                }
-                Err(error) => return Err(ProviderError::Transport(error_chain(&error))),
-            };
-
-            if attempt >= self.retry.max_retries {
-                return Err(error);
-            }
-            let wait = match requested_wait {
-                Some(wait) if wait > self.retry.max_backoff => return Err(error),
-                Some(wait) => wait,
-                None => self.retry.backoff(attempt),
-            };
-            tokio::time::sleep(wait).await;
-            attempt += 1;
-        }
+        send_request(
+            &self.client,
+            &self.endpoint,
+            Some(&self.authorization),
+            Self::API_KEY_ENV,
+            self.retry,
+            body,
+        )
+        .await
     }
 }
 
@@ -271,14 +214,141 @@ impl SystemOneProvider for JevProvider {
         Self::NAME
     }
 
+    fn cache_key(&self) -> Option<String> {
+        Some(format!("{}:{}:{PROMPT_REVISION}", Self::NAME, self.model))
+    }
+
+    fn would_trim(&self, state: &SemanticState) -> bool {
+        would_trim_request(&self.model, state)
+    }
+
     async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
         let body = self.request_body(state)?;
         let response = self.send(body).await?;
-        decisions(&response, state.conflicts.len())
+        decisions(&response, state.chunks.len())
     }
 }
 
-fn config(message: String) -> ProviderError {
+pub(super) fn encode_request(
+    model: &str,
+    state: &SemanticState,
+) -> Result<(Vec<u8>, bool), ProviderError> {
+    let serialize = |candidate: &SemanticState| {
+        let request = Request {
+            model,
+            state: candidate,
+            questions: Questions(candidate.chunks.len()),
+        };
+        serde_json::to_vec(&request).map_err(|error| {
+            ProviderError::Transport(format!("cannot encode the request: {error}"))
+        })
+    };
+
+    let body = serialize(state)?;
+    if body.len() <= MAX_REQUEST_BYTES {
+        return Ok((body, false));
+    }
+
+    if !state.signatures.is_empty() {
+        let mut trimmed = state.clone();
+        while !trimmed.signatures.is_empty() {
+            let mut drop_index = 0;
+            let mut drop_size = 0;
+            for (index, signature) in trimmed.signatures.iter().enumerate() {
+                let size = serde_json::to_vec(signature).map_or(0, |bytes| bytes.len());
+                if size >= drop_size {
+                    drop_size = size;
+                    drop_index = index;
+                }
+            }
+            trimmed.signatures.remove(drop_index);
+            let candidate = serialize(&trimmed)?;
+            if candidate.len() <= MAX_REQUEST_BYTES {
+                return Ok((candidate, true));
+            }
+        }
+        let without_signatures = serialize(&trimmed)?;
+        return Err(ProviderError::TooLarge {
+            bytes: without_signatures.len(),
+            limit: MAX_REQUEST_BYTES,
+        });
+    }
+
+    Err(ProviderError::TooLarge {
+        bytes: body.len(),
+        limit: MAX_REQUEST_BYTES,
+    })
+}
+
+pub(super) fn would_trim_request(model: &str, state: &SemanticState) -> bool {
+    !state.signatures.is_empty() && matches!(encode_request(model, state), Ok((_, true)))
+}
+
+pub(super) async fn send_request(
+    client: &Client,
+    endpoint: &Url,
+    authorization: Option<&HeaderValue>,
+    api_key_env: &str,
+    retry: Retry,
+    body: Vec<u8>,
+) -> Result<Vec<u8>, ProviderError> {
+    let mut attempt = 0;
+    loop {
+        let mut request = client
+            .post(endpoint.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(body.clone());
+        if let Some(authorization) = authorization {
+            request = request.header(header::AUTHORIZATION, authorization.clone());
+        }
+        let sent = request.send().await;
+        let (error, requested_wait) = match sent {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .bytes()
+                    .await
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|error| ProviderError::Transport(error_chain(&error)));
+            }
+            Ok(response) => {
+                let status = response.status();
+                let wait = retry_after(response.headers());
+                let mut message = summarize(&response.text().await.unwrap_or_default());
+                if status == StatusCode::UNAUTHORIZED {
+                    message = format!("{message} (check {api_key_env})")
+                        .trim_start()
+                        .to_owned();
+                }
+                let error = ProviderError::Http {
+                    status: status.as_u16(),
+                    message,
+                };
+                if !is_retryable(status) {
+                    return Err(error);
+                }
+                (error, wait)
+            }
+            Err(error) if error.is_connect() => {
+                (ProviderError::Transport(error_chain(&error)), None)
+            }
+            Err(error) => return Err(ProviderError::Transport(error_chain(&error))),
+        };
+
+        if attempt >= retry.max_retries {
+            return Err(error);
+        }
+        let wait = match requested_wait {
+            Some(wait) if wait > retry.max_backoff => return Err(error),
+            Some(wait) => wait,
+            None => retry.backoff(attempt),
+        };
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
+}
+
+pub(super) fn config(message: String) -> ProviderError {
     ProviderError::Config(message)
 }
 
@@ -287,15 +357,22 @@ fn invalid(message: String) -> ProviderError {
 }
 
 fn endpoint(base_url: &str) -> Result<Url, ProviderError> {
-    let name = JevProvider::BASE_URL_ENV;
-    let mut url = Url::parse(base_url.trim())
+    systemone_endpoint(JevProvider::BASE_URL_ENV, base_url, base_url.trim())
+}
+
+pub(super) fn systemone_endpoint(
+    name: &str,
+    display_url: &str,
+    candidate: &str,
+) -> Result<Url, ProviderError> {
+    let mut url = Url::parse(candidate)
         .map_err(|error| config(format!("{name} is not a valid URL: {error}")))?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(config(format!("{name} must not contain credentials")));
     }
     if url.cannot_be_a_base() || url.query().is_some() || url.fragment().is_some() {
         return Err(config(format!(
-            "{name} `{base_url}` must be a plain http(s) address"
+            "{name} `{display_url}` must be a plain http(s) address"
         )));
     }
     match url.scheme() {
@@ -303,7 +380,7 @@ fn endpoint(base_url: &str) -> Result<Url, ProviderError> {
         "http" if is_loopback(&url) => {}
         _ => {
             return Err(config(format!(
-                "{name} `{base_url}` must use https (plain http is allowed only for localhost)"
+                "{name} `{display_url}` must use https (plain http is allowed only for localhost)"
             )));
         }
     }
@@ -312,7 +389,7 @@ fn endpoint(base_url: &str) -> Result<Url, ProviderError> {
     Ok(url)
 }
 
-fn is_loopback(url: &Url) -> bool {
+pub(super) fn is_loopback(url: &Url) -> bool {
     url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
             || host
@@ -365,23 +442,23 @@ struct Request<'a> {
 }
 
 fn question_id(index: usize) -> String {
-    format!("conflict_{index}")
+    format!("chunk_{index}")
 }
 
-// One Choice question per conflict, keyed `conflict_0`, `conflict_1`, ...
+// One Choice question per chunk, keyed `chunk_0`, `chunk_1`, ...
 struct Questions(usize);
 
 impl Serialize for Questions {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut questions = serializer.serialize_map(Some(self.0))?;
         for index in 0..self.0 {
-            let item = format!("conflicts[{index}]");
+            let chunk = format!("chunks[{index}]");
             questions.serialize_entry(
                 &question_id(index),
                 &Question {
                     kind: "choice",
-                    instructions: instructions(&item),
-                    criteria: Criteria(item),
+                    instructions: instructions(&chunk),
+                    criteria: Criteria(chunk),
                 },
             )?;
         }
@@ -425,7 +502,7 @@ struct Answer {
     probabilities: Option<BTreeMap<String, f64>>,
 }
 
-fn decisions(body: &[u8], count: usize) -> Result<Vec<Decision>, ProviderError> {
+pub(super) fn decisions(body: &[u8], count: usize) -> Result<Vec<Decision>, ProviderError> {
     let response: Response =
         serde_json::from_slice(body).map_err(|error| invalid(error.to_string()))?;
     (0..count)
@@ -488,7 +565,10 @@ fn decision(response: &Response, id: &str) -> Result<Decision, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ast, merge::Versions};
+    use crate::{
+        ast, chunk,
+        merge::{LineMerge, Versions},
+    };
     use serde_json::{Value, json};
     use std::{collections::HashMap, path::Path};
 
@@ -507,9 +587,12 @@ mod tests {
                 .into_bytes(),
         };
         let path = Path::new("src/lib.rs");
+        let merge = LineMerge::new(&versions).unwrap();
         let analysis =
             ast::analyze(path, &versions.base, &versions.ours, &versions.theirs).unwrap();
-        SemanticState::new(path, &analysis, &versions)
+        let chunks = chunk::chunks(&merge, Some(&analysis));
+        let chunks: Vec<_> = chunks.iter().collect();
+        SemanticState::new(path, &analysis, &merge, &chunks)
     }
 
     fn provider() -> JevProvider {
@@ -539,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn asks_one_choice_question_per_conflict_about_the_semantic_state() {
+    fn asks_one_choice_question_per_chunk_about_the_semantic_state() {
         let state = state();
 
         let body = provider().request_body(&state).unwrap();
@@ -550,33 +633,33 @@ mod tests {
         assert_eq!(
             request["questions"],
             json!({
-                "conflict_0": {
+                "chunk_0": {
                     "type": "choice",
-                    "instructions": "`conflicts[0]` is one code item that two branches of a \
-                                     merge changed in different ways. Which version should the \
-                                     merged file contain?",
+                    "instructions": "`chunks[0]` is one chunk of whole code items that two \
+                                     branches of a merge changed in different ways. Which \
+                                     version of it should the merged file contain?",
                     "criteria": {
-                        "Manual": criterion(MergeAction::Manual, "conflicts[0]"),
-                        "TakeOurs": criterion(MergeAction::TakeOurs, "conflicts[0]"),
-                        "TakeTheirs": criterion(MergeAction::TakeTheirs, "conflicts[0]"),
+                        "Manual": criterion(MergeAction::Manual, "chunks[0]"),
+                        "TakeOurs": criterion(MergeAction::TakeOurs, "chunks[0]"),
+                        "TakeTheirs": criterion(MergeAction::TakeTheirs, "chunks[0]"),
                     },
                 },
-                "conflict_1": {
+                "chunk_1": {
                     "type": "choice",
-                    "instructions": instructions("conflicts[1]"),
+                    "instructions": instructions("chunks[1]"),
                     "criteria": {
-                        "Manual": criterion(MergeAction::Manual, "conflicts[1]"),
-                        "TakeOurs": criterion(MergeAction::TakeOurs, "conflicts[1]"),
-                        "TakeTheirs": criterion(MergeAction::TakeTheirs, "conflicts[1]"),
+                        "Manual": criterion(MergeAction::Manual, "chunks[1]"),
+                        "TakeOurs": criterion(MergeAction::TakeOurs, "chunks[1]"),
+                        "TakeTheirs": criterion(MergeAction::TakeTheirs, "chunks[1]"),
                     },
                 },
             })
         );
         assert_eq!(
-            criterion(MergeAction::TakeOurs, "conflicts[1]"),
-            "`conflicts[1].ours` exactly as it is (null means the item is removed). It already \
-             includes the change made in `conflicts[1].theirs` or an equivalent one, so nothing \
-             from `conflicts[1].theirs` is lost."
+            criterion(MergeAction::TakeOurs, "chunks[1]"),
+            "`chunks[1].ours` exactly as it is (null means the chunk is removed). It already \
+             includes the change made in `chunks[1].theirs` or an equivalent one, so nothing \
+             from `chunks[1].theirs` is lost."
         );
 
         let text = String::from_utf8(body).unwrap();
@@ -588,7 +671,7 @@ mod tests {
     #[test]
     fn refuses_requests_over_the_size_limit() {
         let mut state = state();
-        state.conflicts[0].base.as_mut().unwrap().code = "x".repeat(MAX_REQUEST_BYTES);
+        state.chunks[0].base.as_mut().unwrap().code = "x".repeat(MAX_REQUEST_BYTES);
 
         let error = provider().request_body(&state).unwrap_err();
 
@@ -599,10 +682,46 @@ mod tests {
     }
 
     #[test]
+    fn trims_largest_hoisted_signatures_before_rejecting_large_requests() {
+        use crate::state::SignatureState;
+
+        let mut state = state();
+        state.signatures = vec![
+            SignatureState {
+                item: "fn small".to_owned(),
+                signature: Some("fn small() -> u32".to_owned()),
+                base: None,
+                ours: None,
+                theirs: None,
+                chunks: vec![0],
+            },
+            SignatureState {
+                item: "struct Huge".to_owned(),
+                signature: Some("x".repeat(MAX_REQUEST_BYTES)),
+                base: None,
+                ours: None,
+                theirs: None,
+                chunks: vec![0],
+            },
+        ];
+
+        assert!(provider().would_trim(&state));
+        let (body, trimmed) = encode_request("jev-latest", &state).unwrap();
+        assert!(trimmed);
+        assert!(body.len() <= MAX_REQUEST_BYTES);
+        let encoded: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(encoded["state"]["chunks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            encoded["state"]["signatures"],
+            json!([{"item": "fn small", "signature": "fn small() -> u32"}])
+        );
+    }
+
+    #[test]
     fn turns_choice_answers_into_decisions() {
         let body = response(json!({
-            "conflict_0": answer("TakeTheirs", 0.97, [0.01, 0.01, 0.98]),
-            "conflict_1": answer("Manual", 0.4, [0.6, 0.3, 0.1]),
+            "chunk_0": answer("TakeTheirs", 0.97, [0.01, 0.01, 0.98]),
+            "chunk_1": answer("Manual", 0.4, [0.6, 0.3, 0.1]),
         }));
 
         let decisions = decisions(&body, 2).unwrap();
@@ -632,12 +751,12 @@ mod tests {
         let with = |field: &str, value: Value| {
             let mut answer = valid.clone();
             answer[field] = value;
-            response(json!({ "conflict_0": answer }))
+            response(json!({ "chunk_0": answer }))
         };
         let without = |field: &str| {
             let mut answer = valid.clone();
             answer.as_object_mut().unwrap().remove(field);
-            response(json!({ "conflict_0": answer }))
+            response(json!({ "chunk_0": answer }))
         };
 
         for (body, message) in [
@@ -646,32 +765,32 @@ mod tests {
                 serde_json::to_vec(&json!({"answers": {}})).unwrap(),
                 "missing field `model` at line 1 column 14",
             ),
-            (response(json!({})), "answers.conflict_0 is missing"),
+            (response(json!({})), "answers.chunk_0 is missing"),
             (
-                response(json!({"conflict_0": {"type": "noul", "noul": 0.9}})),
-                "answers.conflict_0.type is `noul`, expected `choice`",
+                response(json!({"chunk_0": {"type": "noul", "noul": 0.9}})),
+                "answers.chunk_0.type is `noul`, expected `choice`",
             ),
             (
                 with("choice", json!("TakeBoth")),
-                "answers.conflict_0.choice: unknown decision `TakeBoth` \
+                "answers.chunk_0.choice: unknown decision `TakeBoth` \
                  (expected TakeOurs, TakeTheirs, or Manual)",
             ),
-            (without("choice"), "answers.conflict_0.choice is missing"),
+            (without("choice"), "answers.chunk_0.choice is missing"),
             (
                 with("confidence", json!(1.2)),
-                "answers.conflict_0.confidence: confidence 1.2 is not between 0 and 1",
+                "answers.chunk_0.confidence: confidence 1.2 is not between 0 and 1",
             ),
             (
                 without("confidence"),
-                "answers.conflict_0.confidence is missing",
+                "answers.chunk_0.confidence is missing",
             ),
             (
                 without("probabilities"),
-                "answers.conflict_0.probabilities is missing",
+                "answers.chunk_0.probabilities is missing",
             ),
             (
                 with("probabilities", json!({"TakeOurs": 0.5, "TakeTheirs": 0.5})),
-                "answers.conflict_0.probabilities must list exactly Manual, TakeOurs, and \
+                "answers.chunk_0.probabilities must list exactly Manual, TakeOurs, and \
                  TakeTheirs",
             ),
             (
@@ -679,14 +798,14 @@ mod tests {
                     "probabilities",
                     json!({"Manual": 0.0, "TakeOurs": 1.5, "TakeTheirs": 0.0}),
                 ),
-                "answers.conflict_0.probabilities.TakeOurs: 1.5 is not between 0 and 1",
+                "answers.chunk_0.probabilities.TakeOurs: 1.5 is not between 0 and 1",
             ),
             (
                 with(
                     "probabilities",
                     json!({"Manual": 0.0, "TakeOurs": 1.0, "Other": 0.0}),
                 ),
-                "answers.conflict_0.probabilities.TakeTheirs is missing",
+                "answers.chunk_0.probabilities.TakeTheirs is missing",
             ),
         ] {
             let error = decisions(&body, 1).unwrap_err();
