@@ -2,8 +2,20 @@
 name = "git-weld"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
 description = "A semantic Git merge driver with a safe manual-conflict fallback"
 readme = "../../README.md"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"
+bin-dir = "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dependencies]
 anyhow.workspace = true

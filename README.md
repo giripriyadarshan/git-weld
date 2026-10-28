@@ -180,11 +180,17 @@ markers are left or `1` when some are; it does not modify `base.rs` or
 
 ## Register with Git
 
-Install the binary and configure the driver **locally in the repository that
-should use it**:
+Install a prebuilt binary with [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall)
+(or build from a local checkout) and configure the driver **locally in the
+repository that should use it**:
 
 ```sh
-cargo install --path crates/git-weld --locked
+cargo binstall git-weld
+# Or directly from the GitHub repository before a crates.io release:
+# cargo binstall --git https://github.com/giripriyadarshan/git-weld git-weld
+# Or from a local checkout:
+# cargo install --path crates/git-weld --locked
+
 git config --local merge.git-weld.name "git-weld Semantic Merge Driver"
 git config --local merge.git-weld.driver \
   'git-weld -o %O -a %A -b %B -p %P -l %L'

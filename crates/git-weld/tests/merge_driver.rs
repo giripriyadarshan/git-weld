@@ -1677,3 +1677,49 @@ fn git_worktree_shares_the_decision_cache_across_worktrees() {
     assert_eq!(log[0]["cached"], json!(true));
     assert_eq!(log[0]["resolved"], json!(true));
 }
+
+#[test]
+fn cargo_manifest_declares_binstall_packaging_metadata() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(manifest_dir.join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pkg| pkg["name"] == "git-weld")
+        .expect("git-weld package metadata");
+
+    assert_eq!(
+        package["repository"],
+        json!("https://github.com/giripriyadarshan/git-weld")
+    );
+    assert_eq!(
+        package["metadata"]["binstall"],
+        json!({
+            "pkg-url": "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }",
+            "bin-dir": "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }",
+            "pkg-fmt": "tgz",
+            "overrides": {
+                "x86_64-pc-windows-msvc": {
+                    "pkg-fmt": "zip"
+                },
+                "aarch64-pc-windows-msvc": {
+                    "pkg-fmt": "zip"
+                }
+            }
+        })
+    );
+}

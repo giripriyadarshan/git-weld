@@ -1,0 +1,250 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tgz
+            musl: false
+            native: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            archive: tgz
+            musl: true
+            native: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tgz
+            musl: false
+            native: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive: tgz
+            musl: true
+            native: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tgz
+            musl: false
+            native: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tgz
+            musl: false
+            native: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            musl: false
+            native: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain and kernel headers
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools linux-libc-dev
+          arch="$(uname -m)"
+          sudo ln -sf /usr/include/linux "/usr/include/${arch}-linux-musl/linux"
+          sudo ln -sf /usr/include/asm-generic "/usr/include/${arch}-linux-musl/asm-generic"
+          sudo ln -sf "/usr/include/${arch}-linux-gnu/asm" "/usr/include/${arch}-linux-musl/asm"
+          echo "CC_${target//-/_}=musl-gcc" >> "$GITHUB_ENV"
+        env:
+          target: ${{ matrix.target }}
+
+      - name: Resolve crate version and verify release tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          py_bin="$(command -v python3 || command -v python)"
+          version="$("$py_bin" -c '
+          import json, subprocess
+          out = subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"])
+          meta = json.loads(out)
+          pkg = next(p for p in meta["packages"] if p["name"] == "git-weld")
+          print(pkg["version"])
+          ')"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            expected_tag="v${version}"
+            if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+              echo "Tag ${GITHUB_REF_NAME} does not match crate version ${expected_tag}" >&2
+              exit 1
+            fi
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release --locked --package git-weld --target ${{ matrix.target }}
+
+      - name: Package archive for cargo-binstall
+        id: archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ARCHIVE_FMT: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          pkg_dir="git-weld-${TARGET}-v${VERSION}"
+          stage_dir="dist/${pkg_dir}"
+          mkdir -p "${stage_dir}"
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            bin_name="git-weld.exe"
+          else
+            bin_name="git-weld"
+          fi
+
+          cp "target/${TARGET}/release/${bin_name}" "${stage_dir}/${bin_name}"
+          cp README.md "${stage_dir}/README.md"
+
+          archive_name="${pkg_dir}.${ARCHIVE_FMT}"
+          if [[ "${ARCHIVE_FMT}" == "zip" ]]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path 'dist/${pkg_dir}' -DestinationPath 'dist/${archive_name}' -Force"
+          else
+            tar -czf "dist/${archive_name}" -C dist "${pkg_dir}"
+          fi
+
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${archive_name}" > "${archive_name}.sha256"
+            else
+              shasum -a 256 "${archive_name}" > "${archive_name}.sha256"
+            fi
+          )
+
+          echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Verify archive installation with cargo-binstall
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          NATIVE: ${{ matrix.native }}
+        run: |
+          set -euo pipefail
+          py_bin="$(command -v python3 || command -v python)"
+          "$py_bin" - <<'PY'
+          import functools
+          import http.server
+          import os
+          import pathlib
+          import subprocess
+          import tempfile
+          import threading
+
+          target = os.environ["TARGET"]
+          native = os.environ["NATIVE"].lower() == "true"
+          dist_dir = pathlib.Path("dist").resolve()
+          manifest = pathlib.Path("crates/git-weld/Cargo.toml").resolve()
+          bin_name = "git-weld.exe" if target.endswith("-windows-msvc") else "git-weld"
+
+          class QuietHandler(http.server.SimpleHTTPRequestHandler):
+              def handle(self):
+                  try:
+                      super().handle()
+                  except (BrokenPipeError, ConnectionResetError):
+                      pass
+
+          handler = functools.partial(QuietHandler, directory=str(dist_dir))
+          with tempfile.TemporaryDirectory(dir=str(dist_dir)) as install_dir:
+              with http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) as httpd:
+                  port = httpd.server_port
+                  thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                  thread.start()
+                  try:
+                      cmd = [
+                          "cargo",
+                          "binstall",
+                          "--manifest-path",
+                          str(manifest),
+                          "--targets",
+                          target,
+                          "--strategies",
+                          "crate-meta-data",
+                          "--allow-insecure-http",
+                          "--pkg-url",
+                          f"http://127.0.0.1:{port}/{{ name }}-{{ target }}-v{{ version }}{{ archive-suffix }}",
+                          "--install-path",
+                          install_dir,
+                          "--no-track",
+                          "--no-confirm",
+                          "--force",
+                          "git-weld",
+                      ]
+                      subprocess.run(cmd, check=True)
+                  finally:
+                      httpd.shutdown()
+
+              installed_bin = pathlib.Path(install_dir) / bin_name
+              if not installed_bin.is_file():
+                  raise SystemExit(f"Expected installed binary at {installed_bin}")
+              if native:
+                  subprocess.run([str(installed_bin), "--help"], check=True)
+          PY
+
+      - name: Upload packaged release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/${{ steps.archive.outputs.archive_name }}
+            dist/${{ steps.archive.outputs.archive_name }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download packaged release assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Build SHA256SUMS and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          cat ./*.sha256 | sort -k 2 > SHA256SUMS
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" ./*.tgz ./*.zip ./*.sha256 SHA256SUMS --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" ./*.tgz ./*.zip ./*.sha256 SHA256SUMS \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              --verify-tag
+          fi
