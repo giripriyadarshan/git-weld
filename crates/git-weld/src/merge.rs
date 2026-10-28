@@ -1,6 +1,46 @@
+//! The line-based three-way merge that runs before anything else, like
+//! `git merge-file`, and writing the merged file atomically.
+
 use anyhow::{Context, Result, ensure};
-use std::{fs, io::Write, path::Path};
+use similar::{Algorithm, MergeResolution, TextMerge};
+use std::{
+    error::Error,
+    fmt, fs,
+    io::Write,
+    ops::{Range, RangeInclusive},
+    path::Path,
+};
 use tempfile::NamedTempFile;
+
+/// The labels of the diff3 conflict markers: `<<<<<<< HEAD`,
+/// `||||||| base`, and `>>>>>>> theirs`.
+const LABELS: [&str; 3] = ["base", "HEAD", "theirs"];
+
+/// One of the three versions of a merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Version {
+    Base,
+    Ours,
+    Theirs,
+}
+
+impl Version {
+    pub const ALL: [Self; 3] = [Self::Base, Self::Ours, Self::Theirs];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Base => "base",
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct Versions {
@@ -17,21 +57,436 @@ impl Versions {
             theirs: read_version(theirs, "theirs")?,
         })
     }
+
+    pub fn get(&self, version: Version) -> &[u8] {
+        match version {
+            Version::Base => &self.base,
+            Version::Ours => &self.ours,
+            Version::Theirs => &self.theirs,
+        }
+    }
 }
 
-pub fn write_manual_conflict(output: &Path, versions: &Versions, marker_size: u16) -> Result<()> {
-    ensure!(
-        marker_size > 0,
-        "conflict marker size must be greater than zero"
-    );
+/// How the line merge settled one region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// No side changed these lines.
+    Unchanged,
+    /// Only ours changed them.
+    Ours,
+    /// Only theirs changed them.
+    Theirs,
+    /// Both sides made the same change.
+    Both,
+    /// The sides changed them in different ways.
+    Conflict,
+}
 
-    let conflict = render_conflict(
-        &versions.base,
-        &versions.ours,
-        &versions.theirs,
-        marker_size,
-    );
+/// A run of lines that the merge settled in one way, as 0-based, half-open
+/// line ranges in each version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub resolution: Resolution,
+    pub base: Range<usize>,
+    pub ours: Range<usize>,
+    pub theirs: Range<usize>,
+}
 
+impl Region {
+    pub fn lines(&self, version: Version) -> Range<usize> {
+        match version {
+            Version::Base => self.base.clone(),
+            Version::Ours => self.ours.clone(),
+            Version::Theirs => self.theirs.clone(),
+        }
+    }
+
+    pub fn is_conflict(&self) -> bool {
+        self.resolution == Resolution::Conflict
+    }
+}
+
+/// The merge produced regions that do not fit the three versions, which would
+/// be a bug in the merge algorithm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidMerge(String);
+
+impl fmt::Display for InvalidMerge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "the line merge is inconsistent: {}", self.0)
+    }
+}
+
+impl Error for InvalidMerge {}
+
+/// A three-way merge by lines, like `git merge-file` with the histogram diff
+/// that Git's own merge uses.
+///
+/// Edits that do not overlap combine, and identical edits count once; the
+/// rest become conflicts with their line ranges in every version. A line ends
+/// after `\n`, `\r\n`, or a lone `\r`. Unchanged regions are split into
+/// single lines, so every unchanged line boundary is also a region boundary.
+pub struct LineMerge<'a> {
+    versions: &'a Versions,
+    // The byte offset where each line starts, then the text length.
+    starts: [Vec<usize>; 3],
+    regions: Vec<Region>,
+}
+
+impl<'a> LineMerge<'a> {
+    pub fn new(versions: &'a Versions) -> Result<Self, InvalidMerge> {
+        let merge = TextMerge::configure()
+            .algorithm(Algorithm::Histogram)
+            .merge_lines(
+                versions.base.as_slice(),
+                versions.ours.as_slice(),
+                versions.theirs.as_slice(),
+            );
+        let starts = [
+            line_starts(merge.base_len(), |line| merge.base_line(line)),
+            line_starts(merge.ours_len(), |line| merge.ours_line(line)),
+            line_starts(merge.theirs_len(), |line| merge.theirs_line(line)),
+        ];
+
+        let mut regions = Vec::new();
+        for region in merge.regions() {
+            let resolution = match region.resolution() {
+                MergeResolution::Unchanged => Resolution::Unchanged,
+                MergeResolution::Ours => Resolution::Ours,
+                MergeResolution::Theirs => Resolution::Theirs,
+                MergeResolution::Both => Resolution::Both,
+                _ => Resolution::Conflict,
+            };
+            let (base, ours, theirs) = (
+                region.base_range(),
+                region.ours_range(),
+                region.theirs_range(),
+            );
+            if resolution == Resolution::Unchanged
+                && base.len() == ours.len()
+                && base.len() == theirs.len()
+            {
+                regions.extend((0..base.len()).map(|offset| Region {
+                    resolution,
+                    base: base.start + offset..base.start + offset + 1,
+                    ours: ours.start + offset..ours.start + offset + 1,
+                    theirs: theirs.start + offset..theirs.start + offset + 1,
+                }));
+            } else {
+                regions.push(Region {
+                    resolution,
+                    base,
+                    ours,
+                    theirs,
+                });
+            }
+        }
+
+        let merge = Self {
+            versions,
+            starts,
+            regions,
+        };
+        merge.validate()?;
+        Ok(merge)
+    }
+
+    // Every version must be covered by its regions in order, and a region
+    // must only differ between the versions its resolution says changed.
+    fn validate(&self) -> Result<(), InvalidMerge> {
+        for version in Version::ALL {
+            if self.starts[version.index()].last() != Some(&self.versions.get(version).len()) {
+                return Err(InvalidMerge(format!(
+                    "the {version} lines do not cover the file"
+                )));
+            }
+            let mut next = 0;
+            for region in &self.regions {
+                let lines = region.lines(version);
+                if lines.start != next || lines.end < lines.start {
+                    return Err(InvalidMerge(format!(
+                        "the {version} lines are out of order at line {next}"
+                    )));
+                }
+                next = lines.end;
+            }
+            if next != self.line_count(version) {
+                return Err(InvalidMerge(format!(
+                    "the {version} lines are not all merged"
+                )));
+            }
+        }
+        for region in &self.regions {
+            let same = |left: Version, right: Version| {
+                self.slice(left, region.lines(left)) == self.slice(right, region.lines(right))
+            };
+            let consistent = match region.resolution {
+                Resolution::Unchanged => {
+                    same(Version::Base, Version::Ours) && same(Version::Base, Version::Theirs)
+                }
+                Resolution::Ours => same(Version::Base, Version::Theirs),
+                Resolution::Theirs => same(Version::Base, Version::Ours),
+                Resolution::Both => same(Version::Ours, Version::Theirs),
+                Resolution::Conflict => true,
+            };
+            if !consistent {
+                return Err(InvalidMerge(format!(
+                    "a {:?} region at base lines {:?} changes the wrong versions",
+                    region.resolution, region.base
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    pub fn conflicts(&self) -> usize {
+        self.regions
+            .iter()
+            .filter(|region| region.is_conflict())
+            .count()
+    }
+
+    pub fn is_clean(&self) -> bool {
+        !self.regions.iter().any(Region::is_conflict)
+    }
+
+    pub fn text(&self, version: Version) -> &'a [u8] {
+        self.versions.get(version)
+    }
+
+    pub fn line_count(&self, version: Version) -> usize {
+        self.starts[version.index()].len() - 1
+    }
+
+    /// The bytes of `lines` in `version`.
+    pub fn bytes(&self, version: Version, lines: Range<usize>) -> Range<usize> {
+        let starts = &self.starts[version.index()];
+        starts[lines.start]..starts[lines.end]
+    }
+
+    pub fn slice(&self, version: Version, lines: Range<usize>) -> &'a [u8] {
+        &self.text(version)[self.bytes(version, lines)]
+    }
+
+    /// The line that contains byte `offset` of `version`; the line count for the
+    /// end of the text.
+    pub fn line_at(&self, version: Version, offset: usize) -> usize {
+        self.starts[version.index()].partition_point(|&start| start <= offset) - 1
+    }
+
+    /// The line in `version` where region `index` starts; the line count when
+    /// `index` is the number of regions.
+    pub fn boundary(&self, version: Version, index: usize) -> usize {
+        self.regions.get(index).map_or_else(
+            || self.line_count(version),
+            |region| region.lines(version).start,
+        )
+    }
+
+    /// Writes the merged file. Each span that takes a side is written as that
+    /// side's lines; every other conflict is written as `conflicts` says.
+    /// `spans` must be sorted and must not overlap.
+    pub fn render(&self, spans: &[Span], conflicts: Conflicts) -> Rendered {
+        let mut writer = Writer::default();
+        let mut lines = Vec::with_capacity(spans.len());
+        let mut markers = 0;
+        let mut spans = spans.iter().peekable();
+        let mut index = 0;
+
+        while index < self.regions.len() {
+            let Some(span) = spans.next_if(|span| span.regions.start == index) else {
+                markers += self.write_region(&mut writer, &self.regions[index], conflicts);
+                index += 1;
+                continue;
+            };
+            let start = writer.position();
+            match span.take {
+                Some(version) => writer.write(self.slice(
+                    version,
+                    self.boundary(version, span.regions.start)
+                        ..self.boundary(version, span.regions.end),
+                )),
+                None => {
+                    for region in &self.regions[span.regions.clone()] {
+                        markers += self.write_region(&mut writer, region, conflicts);
+                    }
+                }
+            }
+            lines.push(writer.lines_since(start));
+            index = index.max(span.regions.end);
+        }
+
+        Rendered {
+            text: writer.text,
+            markers,
+            lines,
+        }
+    }
+
+    // Returns 1 when it wrote conflict markers.
+    fn write_region(&self, writer: &mut Writer, region: &Region, conflicts: Conflicts) -> usize {
+        match (region.resolution, conflicts) {
+            (Resolution::Theirs, _) => {
+                writer.write(self.slice(Version::Theirs, region.theirs.clone()));
+            }
+            (Resolution::Conflict, Conflicts::Fill(version)) => {
+                writer.write(self.slice(version, region.lines(version)));
+            }
+            (Resolution::Conflict, Conflicts::Markers(size)) => {
+                self.write_markers(writer, region, size);
+                return 1;
+            }
+            _ => writer.write(self.slice(Version::Ours, region.ours.clone())),
+        }
+        0
+    }
+
+    fn write_markers(&self, writer: &mut Writer, region: &Region, size: u16) {
+        let eol: &[u8] = if self.needs_cr(region) {
+            b"\r\n"
+        } else {
+            b"\n"
+        };
+        let [base, ours, theirs] = LABELS;
+        writer.end_line(eol);
+        writer.marker(b'<', size, ours, eol);
+        writer.lines(self.slice(Version::Ours, region.ours.clone()), eol);
+        writer.marker(b'|', size, base, eol);
+        writer.lines(self.slice(Version::Base, region.base.clone()), eol);
+        writer.marker(b'=', size, "", eol);
+        writer.lines(self.slice(Version::Theirs, region.theirs.clone()), eol);
+        writer.marker(b'>', size, theirs, eol);
+    }
+
+    // Git's rule (`is_cr_needed` in xdiff/xmerge.c): markers end in CRLF when
+    // the lines before the conflict in ours and theirs (or their first lines)
+    // and the first line of base do.
+    fn needs_cr(&self, region: &Region) -> bool {
+        let mut needs = self.ends_in_crlf(Version::Ours, region.ours.start.saturating_sub(1));
+        if needs != Some(false) {
+            needs = self.ends_in_crlf(Version::Theirs, region.theirs.start.saturating_sub(1));
+        }
+        if needs != Some(false) {
+            needs = self.ends_in_crlf(Version::Base, 0);
+        }
+        needs == Some(true)
+    }
+
+    // `None` when the version cannot tell: it is empty, or its only line has
+    // no line ending.
+    fn ends_in_crlf(&self, version: Version, line: usize) -> Option<bool> {
+        let count = self.line_count(version);
+        let crlf = |line: usize| self.slice(version, line..line + 1).ends_with(b"\r\n");
+        if line + 1 < count {
+            return Some(crlf(line));
+        }
+        let last = count.checked_sub(1)?;
+        if self.slice(version, last..count).ends_with(b"\n") {
+            Some(crlf(last))
+        } else {
+            last.checked_sub(1).map(crlf)
+        }
+    }
+}
+
+fn line_starts<'line>(count: usize, line: impl Fn(usize) -> Option<&'line [u8]>) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(count + 1);
+    let mut offset = 0;
+    starts.push(offset);
+    for index in 0..count {
+        offset += line(index).map_or(0, <[u8]>::len);
+        starts.push(offset);
+    }
+    starts
+}
+
+/// A run of regions in [`LineMerge::render`]: written from one side when
+/// `take` is set, merged otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub regions: Range<usize>,
+    pub take: Option<Version>,
+}
+
+/// How [`LineMerge::render`] writes the conflicts outside spans that take a
+/// side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conflicts {
+    /// Standard diff3 markers of the given size (Git's `%L`).
+    Markers(u16),
+    /// One version's lines, for checking that the rest of the file parses.
+    Fill(Version),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: Vec<u8>,
+    /// How many conflicts were written with markers.
+    pub markers: usize,
+    /// Where each span ended up in `text`, as 1-based, inclusive line numbers;
+    /// `None` when it wrote nothing.
+    pub lines: Vec<Option<RangeInclusive<usize>>>,
+}
+
+#[derive(Default)]
+struct Writer {
+    text: Vec<u8>,
+    newlines: usize,
+}
+
+impl Writer {
+    fn write(&mut self, bytes: &[u8]) {
+        self.newlines += bytes.iter().filter(|&&byte| byte == b'\n').count();
+        self.text.extend_from_slice(bytes);
+    }
+
+    fn end_line(&mut self, eol: &[u8]) {
+        if self.text.last().is_some_and(|&byte| byte != b'\n') {
+            self.write(eol);
+        }
+    }
+
+    // Like Git, a missing final line ending is added inside a conflict.
+    fn lines(&mut self, lines: &[u8], eol: &[u8]) {
+        self.write(lines);
+        if !lines.is_empty() {
+            self.end_line(eol);
+        }
+    }
+
+    fn marker(&mut self, marker: u8, size: u16, label: &str, eol: &[u8]) {
+        self.text
+            .extend(std::iter::repeat_n(marker, usize::from(size)));
+        if !label.is_empty() {
+            self.text.push(b' ');
+            self.text.extend_from_slice(label.as_bytes());
+        }
+        self.write(eol);
+    }
+
+    fn position(&self) -> (usize, usize) {
+        (self.text.len(), self.newlines)
+    }
+
+    fn lines_since(&self, (bytes, newlines): (usize, usize)) -> Option<RangeInclusive<usize>> {
+        if self.text.len() == bytes {
+            return None;
+        }
+        let last = if self.text.ends_with(b"\n") {
+            self.newlines
+        } else {
+            self.newlines + 1
+        };
+        Some(newlines + 1..=last.max(newlines + 1))
+    }
+}
+
+/// Replaces `output` with `contents` atomically, keeping its permissions.
+pub fn write_output(output: &Path, contents: &[u8]) -> Result<()> {
     let permissions = fs::metadata(output)
         .with_context(|| format!("failed to inspect output file {}", output.display()))?
         .permissions();
@@ -46,17 +501,32 @@ pub fn write_manual_conflict(output: &Path, versions: &Versions, marker_size: u1
         .set_permissions(permissions)
         .context("failed to preserve output file permissions")?;
     replacement
-        .write_all(&conflict)
-        .context("failed to write conflict output")?;
+        .write_all(contents)
+        .context("failed to write the merged output")?;
     replacement
         .as_file()
         .sync_all()
-        .context("failed to sync conflict output")?;
+        .context("failed to sync the merged output")?;
     replacement
         .persist(output)
         .with_context(|| format!("failed to replace output file {}", output.display()))?;
-
     Ok(())
+}
+
+/// Writes one conflict over the whole file, all three versions in diff3
+/// order. This is the fallback when the line merge cannot be trusted.
+pub fn write_manual_conflict(output: &Path, versions: &Versions, marker_size: u16) -> Result<()> {
+    ensure!(
+        marker_size > 0,
+        "conflict marker size must be greater than zero"
+    );
+    let conflict = render_conflict(
+        &versions.base,
+        &versions.ours,
+        &versions.theirs,
+        marker_size,
+    );
+    write_output(output, &conflict)
 }
 
 fn read_version(path: &Path, version: &str) -> Result<Vec<u8>> {
@@ -64,14 +534,15 @@ fn read_version(path: &Path, version: &str) -> Result<Vec<u8>> {
 }
 
 fn render_conflict(base: &[u8], ours: &[u8], theirs: &[u8], marker_size: u16) -> Vec<u8> {
+    let [base_label, ours_label, theirs_label] = LABELS;
     let mut output = Vec::new();
-    append_marker(&mut output, b'<', marker_size, b"HEAD");
+    append_marker(&mut output, b'<', marker_size, ours_label.as_bytes());
     append_version(&mut output, ours);
-    append_marker(&mut output, b'|', marker_size, b"base");
+    append_marker(&mut output, b'|', marker_size, base_label.as_bytes());
     append_version(&mut output, base);
     append_marker(&mut output, b'=', marker_size, b"");
     append_version(&mut output, theirs);
-    append_marker(&mut output, b'>', marker_size, b"theirs");
+    append_marker(&mut output, b'>', marker_size, theirs_label.as_bytes());
     output
 }
 
@@ -94,7 +565,304 @@ fn append_version(output: &mut Vec<u8>, content: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use similar::ConflictStyle;
     use tempfile::tempdir;
+
+    fn versions(base: &str, ours: &str, theirs: &str) -> Versions {
+        Versions {
+            base: base.as_bytes().to_vec(),
+            ours: ours.as_bytes().to_vec(),
+            theirs: theirs.as_bytes().to_vec(),
+        }
+    }
+
+    fn merged(versions: &Versions, marker_size: u16) -> (String, usize) {
+        let rendered = LineMerge::new(versions)
+            .unwrap()
+            .render(&[], Conflicts::Markers(marker_size));
+        (String::from_utf8(rendered.text).unwrap(), rendered.markers)
+    }
+
+    fn conflict_lines(merge: &LineMerge) -> Vec<[Range<usize>; 3]> {
+        merge
+            .regions()
+            .iter()
+            .filter(|region| region.is_conflict())
+            .map(|region| {
+                [
+                    region.base.clone(),
+                    region.ours.clone(),
+                    region.theirs.clone(),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn combines_edits_that_do_not_overlap() {
+        let versions = versions(
+            "one\ntwo\nthree\nfour\n",
+            "ONE\ntwo\nthree\nfour\n",
+            "one\ntwo\nthree\nFOUR\n",
+        );
+        let merge = LineMerge::new(&versions).unwrap();
+
+        assert!(merge.is_clean());
+        assert_eq!(merge.conflicts(), 0);
+        assert_eq!(
+            merged(&versions, 7),
+            ("ONE\ntwo\nthree\nFOUR\n".to_owned(), 0)
+        );
+    }
+
+    #[test]
+    fn counts_identical_edits_once() {
+        let versions = versions("one\ntwo\n", "one\nTWO\nadded\n", "one\nTWO\nadded\n");
+
+        assert_eq!(merged(&versions, 7), ("one\nTWO\nadded\n".to_owned(), 0));
+    }
+
+    #[test]
+    fn reports_each_conflict_with_its_lines_in_every_version() {
+        let versions = versions(
+            "a\nb\nc\nd\ne\nf\n",
+            "a\nB1\nc\nd\nE1\nf\n",
+            "a\nB2\nc\nd\ne\nf\ng\n",
+        );
+        let merge = LineMerge::new(&versions).unwrap();
+
+        assert_eq!(merge.conflicts(), 1);
+        assert_eq!(conflict_lines(&merge), [[1..2, 1..2, 1..2]]);
+        assert_eq!(
+            merged(&versions, 7).0,
+            "a\n<<<<<<< HEAD\nB1\n||||||| base\nb\n=======\nB2\n>>>>>>> theirs\nc\nd\nE1\nf\ng\n"
+        );
+
+        // Edits that touch each other conflict, as in Git.
+        let touching = self::versions("a\nb\n", "a\nB\n", "a\nb\nc\n");
+        assert_eq!(LineMerge::new(&touching).unwrap().conflicts(), 1);
+
+        let versions = versions_with_two_conflicts();
+        let merge = LineMerge::new(&versions).unwrap();
+        assert_eq!(
+            conflict_lines(&merge),
+            [[1..2, 1..3, 1..2], [3..4, 4..5, 3..3]]
+        );
+    }
+
+    fn versions_with_two_conflicts() -> Versions {
+        versions("a\nb\nc\nd\ne\n", "a\nB1\nB1b\nc\nD1\ne\n", "a\nB2\nc\ne\n")
+    }
+
+    #[test]
+    fn writes_diff3_markers_of_the_requested_size_around_each_conflict() {
+        assert_eq!(
+            merged(&versions_with_two_conflicts(), 3),
+            (
+                "a\n<<< HEAD\nB1\nB1b\n||| base\nb\n===\nB2\n>>> theirs\nc\n\
+                 <<< HEAD\nD1\n||| base\nd\n===\n>>> theirs\ne\n"
+                    .to_owned(),
+                2
+            )
+        );
+    }
+
+    #[test]
+    fn ends_markers_in_crlf_when_the_versions_do_like_git() {
+        let crlf = versions("a\r\nb\r\nc\r\n", "a\r\nB1\r\nc\r\n", "a\r\nB2\r\nc\r\n");
+        assert_eq!(
+            merged(&crlf, 7).0,
+            "a\r\n<<<<<<< HEAD\r\nB1\r\n||||||| base\r\nb\r\n=======\r\nB2\r\n>>>>>>> theirs\r\nc\r\n"
+        );
+
+        let mixed = versions("a\r\nb\r\nc\r\n", "a\r\nB1\r\nc\r\n", "a\nB2\nc\n");
+        assert_eq!(
+            merged(&mixed, 7).0,
+            "<<<<<<< HEAD\na\r\nB1\r\nc\r\n||||||| base\na\r\nb\r\nc\r\n=======\na\nB2\nc\n>>>>>>> theirs\n"
+        );
+    }
+
+    #[test]
+    fn adds_a_missing_final_line_ending_inside_conflicts() {
+        assert_eq!(
+            merged(&versions("a\nb", "a\nours", "a\ntheirs"), 7).0,
+            "a\n<<<<<<< HEAD\nours\n||||||| base\nb\n=======\ntheirs\n>>>>>>> theirs\n"
+        );
+        assert_eq!(
+            merged(&versions("a\r\nb", "a\r\nours", "a\r\ntheirs"), 7).0,
+            "a\r\n<<<<<<< HEAD\r\nours\r\n||||||| base\r\nb\r\n=======\r\ntheirs\r\n\
+             >>>>>>> theirs\r\n"
+        );
+        assert_eq!(
+            merged(&versions("", "ours", "theirs"), 7).0,
+            "<<<<<<< HEAD\nours\n||||||| base\n=======\ntheirs\n>>>>>>> theirs\n"
+        );
+    }
+
+    #[test]
+    fn merges_input_that_is_not_utf8() {
+        let versions = Versions {
+            base: b"\xff\na\nb\n".to_vec(),
+            ours: b"\xff\nA\nb\n".to_vec(),
+            theirs: b"\xff\na\nb\n\xfe\n".to_vec(),
+        };
+
+        let rendered = LineMerge::new(&versions)
+            .unwrap()
+            .render(&[], Conflicts::Markers(7));
+
+        assert_eq!(rendered.text, b"\xff\nA\nb\n\xfe\n");
+        assert_eq!(rendered.markers, 0);
+    }
+
+    #[test]
+    fn splits_unchanged_regions_into_lines() {
+        let versions = versions("a\nb\nc\n", "a\nb\nC\n", "a\nb\nc\n");
+        let merge = LineMerge::new(&versions).unwrap();
+
+        let resolutions: Vec<_> = merge
+            .regions()
+            .iter()
+            .map(|region| (region.resolution, region.base.clone()))
+            .collect();
+        assert_eq!(
+            resolutions,
+            [
+                (Resolution::Unchanged, 0..1),
+                (Resolution::Unchanged, 1..2),
+                (Resolution::Ours, 2..3),
+            ]
+        );
+        assert_eq!(merge.boundary(Version::Ours, 2), 2);
+        assert_eq!(merge.boundary(Version::Ours, 3), 3);
+        assert_eq!(merge.bytes(Version::Ours, 1..3), 2..6);
+        assert_eq!(merge.line_at(Version::Ours, 3), 1);
+        assert_eq!(merge.line_at(Version::Ours, 6), 3);
+    }
+
+    #[test]
+    fn writes_spans_from_the_side_they_take_and_reports_where_they_landed() {
+        let versions = versions_with_two_conflicts();
+        let merge = LineMerge::new(&versions).unwrap();
+        let conflicts: Vec<usize> = (0..merge.regions().len())
+            .filter(|&index| merge.regions()[index].is_conflict())
+            .collect();
+        assert_eq!(conflicts.len(), 2);
+
+        let rendered = merge.render(
+            &[
+                Span {
+                    regions: conflicts[0]..conflicts[0] + 1,
+                    take: Some(Version::Theirs),
+                },
+                Span {
+                    regions: conflicts[1]..conflicts[1] + 1,
+                    take: None,
+                },
+            ],
+            Conflicts::Markers(7),
+        );
+
+        assert_eq!(
+            String::from_utf8(rendered.text).unwrap(),
+            "a\nB2\nc\n<<<<<<< HEAD\nD1\n||||||| base\nd\n=======\n>>>>>>> theirs\ne\n"
+        );
+        assert_eq!(rendered.markers, 1);
+        assert_eq!(rendered.lines, [Some(2..=2), Some(4..=9)]);
+
+        let deleted = merge.render(
+            &[Span {
+                regions: conflicts[1]..conflicts[1] + 1,
+                take: Some(Version::Theirs),
+            }],
+            Conflicts::Fill(Version::Ours),
+        );
+        assert_eq!(
+            String::from_utf8(deleted.text).unwrap(),
+            "a\nB1\nB1b\nc\ne\n"
+        );
+        assert_eq!((deleted.markers, deleted.lines), (0, vec![None]));
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, limit: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % limit as u64) as usize
+        }
+
+        fn line(&mut self) -> &'static str {
+            ["a\n", "b\n", "c\n", "{\n", "}\n", "\n", "    x();\n"][self.below(7)]
+        }
+
+        fn edit(&mut self, base: &[&'static str]) -> Vec<&'static str> {
+            let mut lines = base.to_vec();
+            for _ in 0..self.below(4) {
+                let position = self.below(lines.len() + 1);
+                match self.below(3) {
+                    0 => lines.insert(position, self.line()),
+                    1 if position < lines.len() => {
+                        lines.remove(position);
+                    }
+                    _ if position < lines.len() => lines[position] = self.line(),
+                    _ => {}
+                }
+            }
+            lines
+        }
+    }
+
+    #[test]
+    fn stays_consistent_and_renders_like_similar_on_random_inputs() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..3000 {
+            let base: Vec<_> = (0..random.below(8)).map(|_| random.line()).collect();
+            let (ours, theirs) = (random.edit(&base), random.edit(&base));
+            let mut texts = [base.concat(), ours.concat(), theirs.concat()];
+            if random.below(4) == 0 {
+                let side = random.below(3);
+                texts[side] = texts[side].trim_end_matches('\n').to_owned();
+            }
+            let [base, ours, theirs] = &texts;
+            let versions = versions(base, ours, theirs);
+
+            let merge = LineMerge::new(&versions).unwrap();
+            let rendered = merge.render(&[], Conflicts::Markers(7));
+
+            let mut expected = TextMerge::configure()
+                .algorithm(Algorithm::Histogram)
+                .merge_lines(base.as_bytes(), ours.as_bytes(), theirs.as_bytes());
+            expected
+                .conflict_style(ConflictStyle::Diff3)
+                .labels("base", "HEAD", "theirs");
+            let mut text = Vec::new();
+            expected.to_writer(&mut text).unwrap();
+            assert_eq!(rendered.text, text, "{texts:?}");
+            assert_eq!(rendered.markers, expected.conflict_count(), "{texts:?}");
+            if ours == base {
+                assert_eq!(rendered.text, theirs.as_bytes(), "{texts:?}");
+            }
+            if theirs == base || ours == theirs {
+                assert_eq!(rendered.text, ours.as_bytes(), "{texts:?}");
+            }
+
+            let take_ours: Vec<Span> = (0..merge.regions().len())
+                .filter(|&index| merge.regions()[index].is_conflict())
+                .map(|index| Span {
+                    regions: index..index + 1,
+                    take: Some(Version::Ours),
+                })
+                .collect();
+            assert_eq!(
+                merge.render(&take_ours, Conflicts::Markers(7)).text,
+                merge.render(&[], Conflicts::Fill(Version::Ours)).text,
+                "{texts:?}"
+            );
+        }
+    }
 
     #[test]
     fn renders_all_three_versions_in_diff3_order() {

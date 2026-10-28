@@ -4,20 +4,75 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     fmt::Write,
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
+    sync::OnceLock,
 };
-use tree_sitter::{Node, Tree};
+use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
 const TOP_LEVEL: &str = "(top level)";
+
+const RUST_REFERENCES_QUERY: &str = r#"
+[
+  (type_identifier) @name
+  (call_expression
+    function: [
+      (identifier) @name
+      (field_expression
+        field: (field_identifier) @name)
+      (scoped_identifier
+        name: (identifier) @name)
+      (generic_function
+        function: [
+          (identifier) @name
+          (field_expression
+            field: (field_identifier) @name)
+          (scoped_identifier
+            name: (identifier) @name)
+        ])
+    ])
+  (scoped_identifier
+    path: (identifier) @name)
+  (scoped_type_identifier
+    path: (identifier) @name)
+  (macro_invocation
+    macro: (identifier) @name)
+  (arguments
+    (identifier) @name)
+]
+"#;
+
+const PYTHON_REFERENCES_QUERY: &str = r#"
+[
+  (call
+    function: [
+      (identifier) @name
+      (attribute
+        attribute: (identifier) @name)
+    ])
+  (attribute
+    object: (identifier) @name)
+  (type) @type_expr
+  (argument_list
+    (identifier) @name)
+  (decorator
+    (identifier) @name)
+]
+"#;
 
 // One level of an item's identity, such as `fn get` inside `impl Counter`.
 // `occurrence` separates repeated names in the same body, such as a Python
 // property getter and its setter.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(super) struct Segment {
+pub(crate) struct Segment {
     label: String,
     name: String,
     occurrence: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Reference {
+    pub(crate) bytes: Range<usize>,
+    pub(crate) name: String,
 }
 
 // Containers (impl, trait, mod and extern blocks, and classes) leave their
@@ -26,8 +81,11 @@ pub(super) struct Segment {
 pub(super) struct Item {
     pub(super) key: Vec<Segment>,
     pub(super) path: String,
+    pub(super) name: Option<String>,
+    pub(super) signature: Option<String>,
     pub(super) location: Location,
     pub(super) fingerprint: String,
+    pub(super) container: bool,
 }
 
 struct Body<'tree> {
@@ -82,12 +140,15 @@ pub(super) fn extract(language: Language, source: &str, tree: &Tree) -> Vec<Item
     let mut items = vec![Item {
         key: Vec::new(),
         path: TOP_LEVEL.to_owned(),
+        name: None,
+        signature: None,
         location: Location {
             node_kind: root.kind().to_owned(),
             bytes: 0..source.len(),
             lines: 1..=source.lines().count().max(1),
         },
         fingerprint: String::new(),
+        container: true,
     }];
     let mut bodies = vec![Body {
         node: root,
@@ -144,15 +205,20 @@ pub(super) fn extract(language: Language, source: &str, tree: &Tree) -> Vec<Item
                 Some(_) => String::new(),
                 None => fingerprint(language, source, &leading, child, &HashSet::new()),
             };
+            let (item_name, signature) =
+                extract_signature(language, source, start.start_byte(), child);
             items.push(Item {
                 key,
                 path,
+                name: item_name,
+                signature,
                 location: Location {
                     node_kind: child.kind().to_owned(),
                     bytes: start.start_byte()..child.end_byte(),
                     lines: line_span(start, child),
                 },
                 fingerprint,
+                container: declaration.body.is_some(),
             });
 
             if let Some(inner) = declaration.body {
@@ -619,6 +685,367 @@ fn text<'source>(source: &'source str, node: Node) -> Cow<'source, str> {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub(super) fn references(language: Language, source: &str, tree: &Tree) -> Vec<Reference> {
+    static RUST_QUERY: OnceLock<Query> = OnceLock::new();
+    static PYTHON_QUERY: OnceLock<Query> = OnceLock::new();
+
+    let query = match language {
+        Language::Rust => RUST_QUERY.get_or_init(|| {
+            Query::new(&Language::Rust.grammar(), RUST_REFERENCES_QUERY)
+                .expect("valid Rust reference query")
+        }),
+        Language::Python => PYTHON_QUERY.get_or_init(|| {
+            Query::new(&Language::Python.grammar(), PYTHON_REFERENCES_QUERY)
+                .expect("valid Python reference query")
+        }),
+    };
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    let mut collected = Vec::new();
+    let mut seen = HashSet::new();
+
+    while let Some(matched) = matches.next() {
+        for capture in matched.captures() {
+            let node = capture.node;
+            if language == Language::Python && node.kind() == "type" {
+                collect_python_type_identifiers(source, node, &mut seen, &mut collected);
+                continue;
+            }
+            if is_declaration_name(node) {
+                continue;
+            }
+            let raw = text(source, node);
+            let resolved = if language == Language::Rust && raw == "Self" {
+                enclosing_impl_type(source, node)
+            } else {
+                Some(raw.into_owned())
+            };
+            if let Some(name) = resolved
+                && !name.is_empty()
+                && seen.insert((node.start_byte(), node.end_byte(), name.clone()))
+            {
+                collected.push(Reference {
+                    bytes: node.byte_range(),
+                    name,
+                });
+            }
+        }
+    }
+
+    collected.sort_by_key(|reference| (reference.bytes.start, reference.bytes.end));
+    collected
+}
+
+fn collect_python_type_identifiers(
+    source: &str,
+    root: Node,
+    seen: &mut HashSet<(usize, usize, String)>,
+    collected: &mut Vec<Reference>,
+) {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "identifier" {
+            let name = text(source, node).into_owned();
+            if !name.is_empty() && seen.insert((node.start_byte(), node.end_byte(), name.clone())) {
+                collected.push(Reference {
+                    bytes: node.byte_range(),
+                    name,
+                });
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node().id() == root.id() {
+                return;
+            }
+        }
+    }
+}
+
+fn is_declaration_name(node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(
+        parent.kind(),
+        "function_item"
+            | "function_signature_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "type_item"
+            | "associated_type"
+            | "const_item"
+            | "static_item"
+            | "mod_item"
+            | "macro_definition"
+            | "function_definition"
+            | "class_definition"
+    ) && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+}
+
+fn enclosing_impl_type(source: &str, mut node: Node) -> Option<String> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "impl_item" {
+            let ty = parent.child_by_field_name("type")?;
+            return first_type_identifier(source, ty);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn first_type_identifier(source: &str, root: Node) -> Option<String> {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "type_identifier" {
+            return Some(text(source, node).into_owned());
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() || cursor.node().id() == root.id() {
+                return None;
+            }
+        }
+    }
+}
+
+fn extract_signature(
+    language: Language,
+    source: &str,
+    start_byte: usize,
+    node: Node,
+) -> (Option<String>, Option<String>) {
+    match language {
+        Language::Rust => extract_rust_signature(source, start_byte, node),
+        Language::Python => extract_python_signature(source, start_byte, node),
+    }
+}
+
+fn extract_rust_signature(
+    source: &str,
+    start_byte: usize,
+    node: Node,
+) -> (Option<String>, Option<String>) {
+    let item_name = node
+        .child_by_field_name("name")
+        .map(|n| text(source, n).into_owned())
+        .filter(|s| !s.is_empty());
+
+    let signature = match node.kind() {
+        "function_item" => {
+            let end = node
+                .child_by_field_name("body")
+                .map_or(node.end_byte(), |body| body.start_byte());
+            Some(slice_signature(source, start_byte..end))
+        }
+        "function_signature_item"
+        | "struct_item"
+        | "enum_item"
+        | "union_item"
+        | "type_item"
+        | "associated_type"
+        | "const_item"
+        | "static_item" => Some(slice_signature(source, start_byte..node.end_byte())),
+        "trait_item" => Some(rust_trait_signature(source, start_byte, node)),
+        _ => None,
+    };
+
+    (item_name, signature.filter(|s| !s.is_empty()))
+}
+
+fn rust_trait_signature(source: &str, start_byte: usize, node: Node) -> String {
+    let Some(body) = node.child_by_field_name("body") else {
+        return slice_signature(source, start_byte..node.end_byte());
+    };
+    let header = slice_signature(source, start_byte..body.start_byte());
+    let mut members = Vec::new();
+    let mut trivia: Vec<Node> = Vec::new();
+    let mut cursor = body.walk();
+
+    for child in body.named_children(&mut cursor) {
+        if is_trivia(Language::Rust, child) {
+            trivia.push(child);
+            continue;
+        }
+        let member_start = trivia.first().copied().unwrap_or(child).start_byte();
+        trivia.clear();
+        let member = match child.kind() {
+            "function_item" => {
+                let end = child
+                    .child_by_field_name("body")
+                    .map_or(child.end_byte(), |block| block.start_byte());
+                format!("{};", slice_signature(source, member_start..end))
+            }
+            "function_signature_item" | "associated_type" | "const_item" => {
+                slice_signature(source, member_start..child.end_byte())
+            }
+            _ => continue,
+        };
+        if !member.is_empty() {
+            members.push(indent_lines(&member, "    "));
+        }
+    }
+
+    if members.is_empty() {
+        format!("{header} {{}}")
+    } else {
+        format!("{header} {{\n{}\n}}", members.join("\n"))
+    }
+}
+
+fn extract_python_signature(
+    source: &str,
+    start_byte: usize,
+    node: Node,
+) -> (Option<String>, Option<String>) {
+    let definition = if node.kind() == "decorated_definition" {
+        let Some(inner) = node.child_by_field_name("definition") else {
+            return (None, None);
+        };
+        inner
+    } else {
+        node
+    };
+
+    let item_name = definition
+        .child_by_field_name("name")
+        .map(|n| text(source, n).into_owned())
+        .filter(|s| !s.is_empty());
+
+    let signature = match definition.kind() {
+        "function_definition" => Some(python_header(source, start_byte, definition)),
+        "class_definition" => Some(python_class_signature(source, start_byte, definition)),
+        _ => None,
+    };
+
+    (item_name, signature.filter(|s| !s.is_empty()))
+}
+
+fn python_header(source: &str, start_byte: usize, definition: Node) -> String {
+    let end = match definition.child_by_field_name("body") {
+        Some(body) => {
+            let mut end = body.start_byte();
+            let mut prev = body.prev_sibling();
+            while let Some(sibling) = prev {
+                if !sibling.is_extra() {
+                    end = sibling.end_byte();
+                    break;
+                }
+                prev = sibling.prev_sibling();
+            }
+            end
+        }
+        None => definition.end_byte(),
+    };
+    slice_signature(source, start_byte..end)
+}
+
+fn python_class_signature(source: &str, start_byte: usize, definition: Node) -> String {
+    let header = python_header(source, start_byte, definition);
+    let Some(body) = definition.child_by_field_name("body") else {
+        return header;
+    };
+
+    let mut members = Vec::new();
+    let mut trivia: Vec<Node> = Vec::new();
+    let mut cursor = body.walk();
+
+    for child in body.named_children(&mut cursor) {
+        if is_trivia(Language::Python, child) {
+            trivia.push(child);
+            continue;
+        }
+        let member_start = trivia.first().copied().unwrap_or(child).start_byte();
+        trivia.clear();
+        let inner = if child.kind() == "decorated_definition" {
+            child.child_by_field_name("definition").unwrap_or(child)
+        } else {
+            child
+        };
+        let member = match inner.kind() {
+            "function_definition" => Some(python_header(source, member_start, inner)),
+            "expression_statement" => inner.named_child(0).and_then(|expr| {
+                matches!(expr.kind(), "assignment" | "augmented_assignment")
+                    .then(|| slice_signature(source, member_start..child.end_byte()))
+            }),
+            "type_alias_statement" => Some(slice_signature(source, member_start..child.end_byte())),
+            _ => None,
+        };
+        if let Some(member) = member
+            && !member.is_empty()
+        {
+            members.push(indent_lines(&member, "    "));
+        }
+    }
+
+    if members.is_empty() {
+        header
+    } else {
+        format!("{header}\n{}", members.join("\n"))
+    }
+}
+
+fn slice_signature(source: &str, bytes: Range<usize>) -> String {
+    let mut start = bytes.start.min(source.len());
+    while start > 0 && matches!(source.as_bytes()[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    let raw = source
+        .get(start..bytes.end)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    dedent_signature(raw.trim_end())
+}
+
+fn dedent_signature(text: &str) -> String {
+    let indentation = |line: &str| {
+        let content = line.trim_start_matches([' ', '\t']);
+        line.len() - content.len()
+    };
+    let common = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| &line[..indentation(line)])
+        .reduce(|common, indent| {
+            let shared = common
+                .bytes()
+                .zip(indent.bytes())
+                .take_while(|(left, right)| left == right)
+                .count();
+            &common[..shared]
+        })
+        .unwrap_or_default();
+    text.lines()
+        .map(|line| {
+            line.strip_prefix(common)
+                .unwrap_or_else(|| line.trim_start_matches([' ', '\t']))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn indent_lines(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

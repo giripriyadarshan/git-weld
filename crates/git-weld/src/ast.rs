@@ -1,6 +1,9 @@
 mod items;
 
-use items::{Item, Segment};
+pub use crate::merge::Version;
+pub(crate) use items::Segment;
+
+use items::{Item, Reference};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -43,31 +46,14 @@ impl fmt::Display for Language {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Base,
-    Ours,
-    Theirs,
-}
-
-impl fmt::Display for Side {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Base => "base",
-            Self::Ours => "ours",
-            Self::Theirs => "theirs",
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnalysisError {
     UnsupportedFileType,
     InvalidUtf8 {
-        side: Side,
+        version: Version,
     },
     Syntax {
-        side: Side,
+        version: Version,
         line: usize,
         column: usize,
     },
@@ -83,10 +69,14 @@ impl fmt::Display for AnalysisError {
             Self::UnsupportedFileType => {
                 formatter.write_str("unsupported file type (supported: .rs, .py)")
             }
-            Self::InvalidUtf8 { side } => write!(formatter, "{side} is not valid UTF-8"),
-            Self::Syntax { side, line, column } => write!(
+            Self::InvalidUtf8 { version } => write!(formatter, "{version} is not valid UTF-8"),
+            Self::Syntax {
+                version,
+                line,
+                column,
+            } => write!(
                 formatter,
-                "{side} has a syntax error at line {line}, column {column}"
+                "{version} has a syntax error at line {line}, column {column}"
             ),
             Self::Parser { language, message } => {
                 write!(formatter, "the {language} parser failed: {message}")
@@ -100,22 +90,139 @@ impl Error for AnalysisError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Analysis {
     pub language: Language,
-    pub conflicts: Vec<Conflict>,
+    /// The items that both sides changed, in the order they first appear.
+    pub diverged_items: Vec<DivergedItem>,
+    outlines: [Outline; 3],
 }
+
+impl Analysis {
+    /// The items of one version.
+    pub fn outline(&self, version: Version) -> &Outline {
+        &self.outlines[version as usize]
+    }
+}
+
+/// The items of one version as a tree. The root (index 0) is the whole file;
+/// the children of a container are the members of its body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outline {
+    items: Vec<OutlineItem>,
+    references: Vec<Reference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineItem {
+    pub(crate) key: Vec<Segment>,
+    /// Human-readable path, such as `impl Counter > fn get`.
+    pub path: String,
+    pub(crate) name: Option<String>,
+    pub(crate) signature: Option<String>,
+    pub node_kind: String,
+    /// Includes the item's leading comments, attributes, and decorators.
+    pub bytes: Range<usize>,
+    pub(crate) parent: Option<usize>,
+    /// Indices of the members, in file order. Only containers have members.
+    pub children: Vec<usize>,
+    /// Whether the members are compared one by one: impl, trait, mod, and
+    /// extern blocks, classes, and the root.
+    pub container: bool,
+}
+
+impl Outline {
+    pub const ROOT: usize = 0;
+
+    fn new(items: &[Item], references: Vec<Reference>) -> Self {
+        let positions: HashMap<&[Segment], usize> = items
+            .iter()
+            .enumerate()
+            .map(|(position, item)| (item.key.as_slice(), position))
+            .collect();
+        let mut outline: Vec<OutlineItem> = items
+            .iter()
+            .map(|item| OutlineItem {
+                key: item.key.clone(),
+                path: item.path.clone(),
+                name: item.name.clone(),
+                signature: item.signature.clone(),
+                node_kind: item.location.node_kind.clone(),
+                bytes: item.location.bytes.clone(),
+                parent: None,
+                children: Vec::new(),
+                container: item.container,
+            })
+            .collect();
+        for (position, item) in items.iter().enumerate() {
+            if let Some((_, parent)) = item.key.split_last()
+                && let Some(&parent) = positions.get(parent)
+                && parent != position
+            {
+                outline[position].parent = Some(parent);
+                outline[parent].children.push(position);
+            }
+        }
+        Self {
+            items: outline,
+            references,
+        }
+    }
+
+    pub fn item(&self, index: usize) -> &OutlineItem {
+        &self.items[index]
+    }
+
+    pub fn items(&self) -> &[OutlineItem] {
+        &self.items
+    }
+
+    /// Names referenced inside `bytes`, in source order.
+    pub fn referenced_names(&self, bytes: Range<usize>) -> impl Iterator<Item = &str> {
+        self.references
+            .iter()
+            .filter(move |reference| {
+                bytes.start <= reference.bytes.start && reference.bytes.end <= bytes.end
+            })
+            .map(|reference| reference.name.as_str())
+    }
+}
+
+/// Why a merged result does not parse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyntaxError {
+    InvalidUtf8,
+    At { line: usize, column: usize },
+    Parser(String),
+}
+
+impl fmt::Display for SyntaxError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUtf8 => formatter.write_str("it is not valid UTF-8"),
+            Self::At { line, column } => {
+                write!(
+                    formatter,
+                    "it has a syntax error at line {line}, column {column}"
+                )
+            }
+            Self::Parser(message) => write!(formatter, "the parser failed: {message}"),
+        }
+    }
+}
+
+impl Error for SyntaxError {}
 
 /// An item that both sides changed relative to the base in different ways.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Conflict {
+pub struct DivergedItem {
     /// Human-readable path, such as `impl Counter > fn get`.
     pub item: String,
-    pub kind: ConflictKind,
+    pub kind: Divergence,
     pub base: Option<Location>,
     pub ours: Option<Location>,
     pub theirs: Option<Location>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConflictKind {
+pub enum Divergence {
     BothModified,
     BothAdded,
     ModifiedInOursDeletedInTheirs,
@@ -131,27 +238,27 @@ pub struct Location {
     pub lines: RangeInclusive<usize>,
 }
 
-impl fmt::Display for Conflict {
+impl fmt::Display for DivergedItem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let change = match self.kind {
-            ConflictKind::BothModified => "modified on both sides",
-            ConflictKind::BothAdded => "added on both sides with different content",
-            ConflictKind::ModifiedInOursDeletedInTheirs => "modified in ours, deleted in theirs",
-            ConflictKind::DeletedInOursModifiedInTheirs => "deleted in ours, modified in theirs",
+            Divergence::BothModified => "modified on both sides",
+            Divergence::BothAdded => "added on both sides with different content",
+            Divergence::ModifiedInOursDeletedInTheirs => "modified in ours, deleted in theirs",
+            Divergence::DeletedInOursModifiedInTheirs => "deleted in ours, modified in theirs",
         };
         write!(formatter, "{}: {change} (", self.item)?;
         let mut separator = "";
-        for (side, location) in [
-            (Side::Base, &self.base),
-            (Side::Ours, &self.ours),
-            (Side::Theirs, &self.theirs),
+        for (version, location) in [
+            (Version::Base, &self.base),
+            (Version::Ours, &self.ours),
+            (Version::Theirs, &self.theirs),
         ] {
             if let Some(location) = location {
                 let (first, last) = (location.lines.start(), location.lines.end());
                 if first == last {
-                    write!(formatter, "{separator}{side} line {first}")?;
+                    write!(formatter, "{separator}{version} line {first}")?;
                 } else {
-                    write!(formatter, "{separator}{side} lines {first}-{last}")?;
+                    write!(formatter, "{separator}{version} lines {first}-{last}")?;
                 }
                 separator = ", ";
             }
@@ -178,43 +285,97 @@ pub fn analyze(
             message: error.to_string(),
         })?;
 
-    let mut extract = |side: Side, source: &[u8]| -> Result<Vec<Item>, AnalysisError> {
-        let (text, tree) = parse(&mut parser, language, side, source)?;
-        Ok(items::extract(language, text, &tree))
+    let mut extract = |version: Version,
+                       source: &[u8]|
+     -> Result<(Vec<Item>, Vec<Reference>), AnalysisError> {
+        let (text, tree) = parse(&mut parser, language, source).map_err(|error| match error {
+            SyntaxError::InvalidUtf8 => AnalysisError::InvalidUtf8 { version },
+            SyntaxError::At { line, column } => AnalysisError::Syntax {
+                version,
+                line,
+                column,
+            },
+            SyntaxError::Parser(message) => AnalysisError::Parser { language, message },
+        })?;
+        Ok((
+            items::extract(language, text, &tree),
+            items::references(language, text, &tree),
+        ))
     };
-    let base = extract(Side::Base, base)?;
-    let ours = extract(Side::Ours, ours)?;
-    let theirs = extract(Side::Theirs, theirs)?;
+    let (base, base_refs) = extract(Version::Base, base)?;
+    let (ours, ours_refs) = extract(Version::Ours, ours)?;
+    let (theirs, theirs_refs) = extract(Version::Theirs, theirs)?;
 
     Ok(Analysis {
         language,
-        conflicts: compare(&base, &ours, &theirs),
+        diverged_items: compare(&base, &ours, &theirs),
+        outlines: [
+            Outline::new(&base, base_refs),
+            Outline::new(&ours, ours_refs),
+            Outline::new(&theirs, theirs_refs),
+        ],
     })
+}
+
+/// Checks that `source`, such as a stitched merge result, parses as
+/// `language` without syntax errors.
+pub fn check_syntax(language: Language, source: &[u8]) -> Result<(), SyntaxError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language.grammar())
+        .map_err(|error| SyntaxError::Parser(error.to_string()))?;
+    parse(&mut parser, language, source).map(|_| ())
 }
 
 fn parse<'source>(
     parser: &mut Parser,
     language: Language,
-    side: Side,
     source: &'source [u8],
-) -> Result<(&'source str, Tree), AnalysisError> {
-    let text = std::str::from_utf8(source).map_err(|_| AnalysisError::InvalidUtf8 { side })?;
+) -> Result<(&'source str, Tree), SyntaxError> {
+    let text = std::str::from_utf8(source).map_err(|_| SyntaxError::InvalidUtf8)?;
     let tree = parser
         .parse(text, None)
-        .ok_or_else(|| AnalysisError::Parser {
-            language,
-            message: "parsing did not complete".to_owned(),
-        })?;
+        .ok_or_else(|| SyntaxError::Parser("parsing did not complete".to_owned()))?;
     let root = tree.root_node();
-    if root.has_error() {
-        let point = first_error(root).unwrap_or_else(|| root.start_position());
-        return Err(AnalysisError::Syntax {
-            side,
+    let error = if root.has_error() {
+        Some(first_error(root).unwrap_or_else(|| root.start_position()))
+    } else if language == Language::Python {
+        first_empty_block(root)
+    } else {
+        None
+    };
+    match error {
+        Some(point) => Err(SyntaxError::At {
             line: point.row + 1,
             column: point.column + 1,
-        });
+        }),
+        None => Ok((text, tree)),
     }
-    Ok((text, tree))
+}
+
+// tree-sitter-python accepts a block without statements, such as a class
+// whose only method was removed, but Python rejects it ("expected an indented
+// block").
+fn first_empty_block(root: Node) -> Option<Point> {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "block"
+            && !node
+                .named_children(&mut node.walk())
+                .any(|child| !child.is_extra())
+        {
+            return Some(node.start_position());
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
 }
 
 fn first_error(root: Node) -> Option<Point> {
@@ -235,11 +396,11 @@ fn first_error(root: Node) -> Option<Point> {
     }
 }
 
-fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<Conflict> {
+fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<DivergedItem> {
     let (base_index, ours_index, theirs_index) = (index(base), index(ours), index(theirs));
     let mut seen = HashSet::new();
     let mut deleted: Vec<&[Segment]> = Vec::new();
-    let mut conflicts = Vec::new();
+    let mut diverged = Vec::new();
 
     for key in base
         .iter()
@@ -261,20 +422,20 @@ fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<Conflict> {
                     && old.fingerprint != new_theirs.fingerprint
                     && new_ours.fingerprint != new_theirs.fingerprint =>
             {
-                ConflictKind::BothModified
+                Divergence::BothModified
             }
             (None, Some(new_ours), Some(new_theirs))
                 if new_ours.fingerprint != new_theirs.fingerprint =>
             {
-                ConflictKind::BothAdded
+                Divergence::BothAdded
             }
             (Some(_), Some(_), None) if adds_or_modifies(key, &base_index, ours) => {
                 deleted.push(key);
-                ConflictKind::ModifiedInOursDeletedInTheirs
+                Divergence::ModifiedInOursDeletedInTheirs
             }
             (Some(_), None, Some(_)) if adds_or_modifies(key, &base_index, theirs) => {
                 deleted.push(key);
-                ConflictKind::DeletedInOursModifiedInTheirs
+                Divergence::DeletedInOursModifiedInTheirs
             }
             _ => continue,
         };
@@ -282,7 +443,7 @@ fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<Conflict> {
             .or(new_theirs)
             .or(old)
             .map(|item| item.path.clone());
-        conflicts.push(Conflict {
+        diverged.push(DivergedItem {
             item: path.unwrap_or_default(),
             kind,
             base: old.map(|item| item.location.clone()),
@@ -290,7 +451,7 @@ fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<Conflict> {
             theirs: new_theirs.map(|item| item.location.clone()),
         });
     }
-    conflicts
+    diverged
 }
 
 fn index(items: &[Item]) -> HashMap<&[Segment], &Item> {
@@ -346,16 +507,16 @@ class Greeter:
         )
     }
 
-    fn summary(path: &str, base: &str, ours: &str, theirs: &str) -> Vec<(String, ConflictKind)> {
+    fn summary(path: &str, base: &str, ours: &str, theirs: &str) -> Vec<(String, Divergence)> {
         analyze_text(path, base, ours, theirs)
             .unwrap()
-            .conflicts
+            .diverged_items
             .into_iter()
-            .map(|conflict| (conflict.item, conflict.kind))
+            .map(|diverged| (diverged.item, diverged.kind))
             .collect()
     }
 
-    fn conflict(item: &str, kind: ConflictKind) -> (String, ConflictKind) {
+    fn diverged(item: &str, kind: Divergence) -> (String, Divergence) {
         (item.to_owned(), kind)
     }
 
@@ -433,7 +594,12 @@ class Greeter:
         )
         .unwrap_err();
 
-        assert_eq!(error, AnalysisError::InvalidUtf8 { side: Side::Theirs });
+        assert_eq!(
+            error,
+            AnalysisError::InvalidUtf8 {
+                version: Version::Theirs
+            }
+        );
         assert_eq!(error.to_string(), "theirs is not valid UTF-8");
     }
 
@@ -450,7 +616,7 @@ class Greeter:
             matches!(
                 error,
                 AnalysisError::Syntax {
-                    side: Side::Ours,
+                    version: Version::Ours,
                     line: 2,
                     ..
                 }
@@ -470,12 +636,47 @@ class Greeter:
             matches!(
                 error,
                 AnalysisError::Syntax {
-                    side: Side::Base,
+                    version: Version::Base,
                     line: 1,
                     ..
                 }
             ),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_python_blocks_without_statements_like_python_does() {
+        for source in [
+            "class A:\n\n",
+            "def f():\n    # Only a comment.\n",
+            "if x:\nelse:\n    pass\n",
+        ] {
+            let error = check_syntax(Language::Python, source.as_bytes()).unwrap_err();
+            assert!(
+                matches!(error, SyntaxError::At { .. }),
+                "{source:?}: {error:?}"
+            );
+            assert!(
+                analyze_text("app.py", source, "x = 1\n", "x = 2\n").is_err(),
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            check_syntax(Language::Python, b"class A:\n    pass\n"),
+            Ok(())
+        );
+        assert_eq!(check_syntax(Language::Python, b"class A: pass\n"), Ok(()));
+        assert_eq!(check_syntax(Language::Rust, b"fn f() {}\n"), Ok(()));
+        assert_eq!(
+            check_syntax(Language::Rust, b"fn f( {}\n")
+                .unwrap_err()
+                .to_string(),
+            "it has a syntax error at line 1, column 6"
+        );
+        assert_eq!(
+            check_syntax(Language::Rust, b"\xff").unwrap_err(),
+            SyntaxError::InvalidUtf8
         );
     }
 
@@ -491,10 +692,10 @@ class Greeter:
 
         assert_eq!(analysis.language, Language::Rust);
         assert_eq!(
-            analysis.conflicts,
-            [Conflict {
+            analysis.diverged_items,
+            [DivergedItem {
                 item: "fn alpha".to_owned(),
-                kind: ConflictKind::BothModified,
+                kind: Divergence::BothModified,
                 base: Some(location(
                     RUST_BASE,
                     "fn alpha() -> u32 {\n    1\n}",
@@ -516,7 +717,7 @@ class Greeter:
             }]
         );
         assert_eq!(
-            analysis.conflicts[0].to_string(),
+            analysis.diverged_items[0].to_string(),
             "fn alpha: modified on both sides (base lines 1-3, ours lines 1-3, theirs lines 3-5)"
         );
     }
@@ -536,15 +737,15 @@ class Greeter:
         let (three, four) = (added("3"), added("4"));
 
         let analysis = analyze_text("lib.rs", RUST_BASE, &three, &four).unwrap();
-        assert_eq!(analysis.conflicts.len(), 1);
-        let conflict = &analysis.conflicts[0];
-        assert_eq!(conflict.item, "fn gamma");
-        assert_eq!(conflict.kind, ConflictKind::BothAdded);
-        assert_eq!(conflict.base, None);
-        assert_eq!(conflict.ours.as_ref().unwrap().lines, 9..=11);
-        assert_eq!(conflict.theirs.as_ref().unwrap().lines, 9..=11);
+        assert_eq!(analysis.diverged_items.len(), 1);
+        let item = &analysis.diverged_items[0];
+        assert_eq!(item.item, "fn gamma");
+        assert_eq!(item.kind, Divergence::BothAdded);
+        assert_eq!(item.base, None);
+        assert_eq!(item.ours.as_ref().unwrap().lines, 9..=11);
+        assert_eq!(item.theirs.as_ref().unwrap().lines, 9..=11);
         assert_eq!(
-            conflict.to_string(),
+            item.to_string(),
             "fn gamma: added on both sides with different content (ours lines 9-11, theirs lines 9-11)"
         );
 
@@ -559,22 +760,22 @@ class Greeter:
         let beta = RUST_BASE.replace("    2\n", "    20\n");
 
         let analysis = analyze_text("lib.rs", RUST_BASE, &deleted, &modified).unwrap();
-        assert_eq!(analysis.conflicts.len(), 1);
+        assert_eq!(analysis.diverged_items.len(), 1);
         assert_eq!(
-            analysis.conflicts[0].kind,
-            ConflictKind::DeletedInOursModifiedInTheirs
+            analysis.diverged_items[0].kind,
+            Divergence::DeletedInOursModifiedInTheirs
         );
-        assert_eq!(analysis.conflicts[0].ours, None);
+        assert_eq!(analysis.diverged_items[0].ours, None);
         assert_eq!(
-            analysis.conflicts[0].to_string(),
+            analysis.diverged_items[0].to_string(),
             "fn alpha: deleted in ours, modified in theirs (base lines 1-3, theirs lines 1-3)"
         );
 
         assert_eq!(
             summary("lib.rs", RUST_BASE, &modified, &deleted),
-            [conflict(
+            [diverged(
                 "fn alpha",
-                ConflictKind::ModifiedInOursDeletedInTheirs
+                Divergence::ModifiedInOursDeletedInTheirs
             )]
         );
         assert_eq!(summary("lib.rs", RUST_BASE, &deleted, &deleted), []);
@@ -609,10 +810,7 @@ impl Counter {
                 &get("self.value + 1"),
                 &get("self.value * 2")
             ),
-            [conflict(
-                "impl Counter > fn get",
-                ConflictKind::BothModified
-            )]
+            [diverged("impl Counter > fn get", Divergence::BothModified)]
         );
     }
 
@@ -632,16 +830,16 @@ impl Counter {
 
         assert_eq!(
             summary("lib.rs", base, without_impl, &with_method),
-            [conflict(
+            [diverged(
                 "impl Counter",
-                ConflictKind::DeletedInOursModifiedInTheirs
+                Divergence::DeletedInOursModifiedInTheirs
             )]
         );
         assert_eq!(
             summary("lib.rs", base, &edited_methods, without_impl),
-            [conflict(
+            [diverged(
                 "impl Counter",
-                ConflictKind::ModifiedInOursDeletedInTheirs
+                Divergence::ModifiedInOursDeletedInTheirs
             )]
         );
         assert_eq!(summary("lib.rs", base, without_impl, &without_reset), []);
@@ -667,10 +865,10 @@ impl Counter {
 
         assert_eq!(analysis.language, Language::Python);
         assert_eq!(
-            analysis.conflicts,
-            [Conflict {
+            analysis.diverged_items,
+            [DivergedItem {
                 item: "def alpha".to_owned(),
-                kind: ConflictKind::BothModified,
+                kind: Divergence::BothModified,
                 base: Some(location(
                     PYTHON_BASE,
                     "def alpha():\n    return 1",
@@ -714,9 +912,9 @@ impl Counter {
                 &hello("return \"hi\""),
                 &hello("return \"hey\"")
             ),
-            [conflict(
+            [diverged(
                 "class Greeter > def hello",
-                ConflictKind::BothModified
+                Divergence::BothModified
             )]
         );
     }
@@ -729,21 +927,21 @@ impl Counter {
 
         assert_eq!(
             summary("app.py", PYTHON_BASE, &added("3"), &added("4")),
-            [conflict("def gamma", ConflictKind::BothAdded)]
+            [diverged("def gamma", Divergence::BothAdded)]
         );
         assert_eq!(summary("app.py", PYTHON_BASE, &added("3"), &added("3")), []);
         assert_eq!(
             summary("app.py", PYTHON_BASE, &deleted, &modified),
-            [conflict(
+            [diverged(
                 "def alpha",
-                ConflictKind::DeletedInOursModifiedInTheirs
+                Divergence::DeletedInOursModifiedInTheirs
             )]
         );
         assert_eq!(
             summary("app.py", PYTHON_BASE, &modified, &deleted),
-            [conflict(
+            [diverged(
                 "def alpha",
-                ConflictKind::ModifiedInOursDeletedInTheirs
+                Divergence::ModifiedInOursDeletedInTheirs
             )]
         );
         assert_eq!(summary("app.py", PYTHON_BASE, &deleted, &deleted), []);
@@ -767,10 +965,10 @@ class Box:
 
         let analysis =
             analyze_text("box.py", base, &ours, &setter("self._size = abs(value)")).unwrap();
-        assert_eq!(analysis.conflicts.len(), 1);
-        assert_eq!(analysis.conflicts[0].item, "class Box > def size #2");
+        assert_eq!(analysis.diverged_items.len(), 1);
+        assert_eq!(analysis.diverged_items[0].item, "class Box > def size #2");
         assert_eq!(
-            analysis.conflicts[0].ours,
+            analysis.diverged_items[0].ours,
             Some(location(
                 &ours,
                 "@size.setter\n    def size(self, value):\n        self._size = value * 2",

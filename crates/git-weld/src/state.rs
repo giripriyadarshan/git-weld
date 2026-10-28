@@ -1,16 +1,18 @@
 //! The provider-agnostic semantic state: a neutral, deterministic description
-//! of every item both sides changed, as plain text ([`fmt::Display`]) or as
-//! JSON ([`Serialize`]).
+//! of every chunk that both sides changed, as plain text ([`fmt::Display`]) or
+//! as JSON ([`Serialize`]).
 
 use crate::{
-    ast::{Analysis, Conflict, ConflictKind, Language, Location},
-    merge::Versions,
+    ast::{Analysis, Language, Outline, OutlineItem, Segment},
+    chunk::{Chunk, ChunkItem},
+    merge::{LineMerge, Version as MergeVersion},
 };
 use serde::Serialize;
 use similar::TextDiff;
 use std::{
+    collections::{HashMap, HashSet},
     fmt,
-    ops::{Range, RangeInclusive},
+    ops::RangeInclusive,
     path::Path,
 };
 
@@ -19,18 +21,44 @@ pub struct SemanticState {
     /// The logical path of the merged file (`%P`).
     pub file: String,
     pub language: Language,
-    pub conflicts: Vec<ConflictState>,
+    pub chunks: Vec<ChunkState>,
+    /// Signatures of items in the same file that the chunks reference.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<SignatureState>,
 }
 
-/// One conflicting item. A missing version (`null` in JSON) means the item
-/// does not exist on that side: it was added on both sides or deleted on one.
+/// The signature of an item referenced by one or more chunks: once when all
+/// three versions agree, or once per version when they differ.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ConflictState {
-    /// Path of the item, such as `impl Counter > fn get`.
+pub struct SignatureState {
+    /// Human-readable path, such as `struct User` or `fn helper`.
     pub item: String,
-    /// The tree-sitter node type, such as `function_item`.
-    pub node_type: String,
-    /// One neutral sentence per version saying what happened to the item.
+    /// The signature when it is identical in base, ours, and theirs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The base signature when the versions differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Our signature when the versions differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ours: Option<String>,
+    /// Their signature when the versions differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theirs: Option<String>,
+    /// Indices in [`SemanticState::chunks`] that reference this item.
+    #[serde(skip)]
+    pub chunks: Vec<usize>,
+}
+
+/// One chunk: whole items that both sides changed. A missing version (`null`
+/// in JSON) means the chunk is empty on that side: its items were added on
+/// both sides or deleted on one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChunkState {
+    /// The paths of the chunk's items, such as `impl Counter > fn get`: those
+    /// of base, then those that only ours or theirs has.
+    pub items: Vec<String>,
+    /// One neutral sentence per version saying what happened to the chunk.
     pub summary: String,
     pub base: Option<Version>,
     pub ours: Option<Version>,
@@ -41,8 +69,9 @@ pub struct ConflictState {
 pub struct Version {
     #[serde(skip)]
     pub lines: RangeInclusive<usize>,
-    /// The item's code, including its comments, attributes, and decorators,
-    /// with the common indentation removed and `\n` line endings.
+    /// The chunk's code, including comments, attributes, and decorators,
+    /// without blank lines around it, with the common indentation removed and
+    /// `\n` line endings.
     pub code: String,
     /// Unified diff from the base version, when both versions exist.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,42 +79,198 @@ pub struct Version {
 }
 
 impl SemanticState {
-    pub fn new(path: &Path, analysis: &Analysis, versions: &Versions) -> Self {
+    /// Describes `chunks` of the merge of the file at `path`, including the
+    /// signatures of any items in the same file that `chunks` reference.
+    pub fn new(path: &Path, analysis: &Analysis, merge: &LineMerge, chunks: &[&Chunk]) -> Self {
         Self {
             file: path.display().to_string(),
             language: analysis.language,
-            conflicts: analysis
-                .conflicts
+            chunks: chunks
                 .iter()
-                .map(|conflict| ConflictState::new(conflict, versions))
+                .map(|chunk| ChunkState::new(merge, chunk))
                 .collect(),
+            signatures: hoist_signatures(analysis, merge, chunks),
+        }
+    }
+
+    /// The hoisted signatures referenced by `chunk` (an index into
+    /// [`Self::chunks`]), in state order.
+    pub fn signatures_for_chunk(&self, chunk: usize) -> impl Iterator<Item = &SignatureState> {
+        self.signatures
+            .iter()
+            .filter(move |signature| signature.chunks.contains(&chunk))
+    }
+
+    /// Builds a state with only the chunks at `indices` and the signatures
+    /// those chunks reference.
+    pub fn select_chunks(&self, indices: &[usize]) -> Self {
+        let chunks = indices
+            .iter()
+            .filter_map(|&index| self.chunks.get(index).cloned())
+            .collect();
+        let signatures = self
+            .signatures
+            .iter()
+            .filter_map(|signature| {
+                let remapped: Vec<usize> = indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(new_index, &old_index)| {
+                        signature.chunks.contains(&old_index).then_some(new_index)
+                    })
+                    .collect();
+                (!remapped.is_empty()).then(|| SignatureState {
+                    chunks: remapped,
+                    ..signature.clone()
+                })
+            })
+            .collect();
+        Self {
+            file: self.file.clone(),
+            language: self.language,
+            chunks,
+            signatures,
         }
     }
 }
 
-impl ConflictState {
-    fn new(conflict: &Conflict, versions: &Versions) -> Self {
-        let base = conflict
-            .base
-            .as_ref()
-            .map(|location| Version::new(&versions.base, location, None));
-        let side = |source: &[u8], location: &Option<Location>| {
-            location
-                .as_ref()
-                .map(|location| Version::new(source, location, base.as_ref()))
-        };
-        let ours = side(&versions.ours, &conflict.ours);
-        let theirs = side(&versions.theirs, &conflict.theirs);
-        let node_type = [&conflict.base, &conflict.ours, &conflict.theirs]
-            .into_iter()
-            .flatten()
-            .next()
-            .map(|location| location.node_kind.clone())
-            .unwrap_or_default();
+fn hoist_signatures(
+    analysis: &Analysis,
+    merge: &LineMerge,
+    chunks: &[&Chunk],
+) -> Vec<SignatureState> {
+    let outlines = MergeVersion::ALL.map(|version| analysis.outline(version));
+    let by_key: [HashMap<&[Segment], &OutlineItem>; 3] = outlines.map(|outline| {
+        outline
+            .items()
+            .iter()
+            .skip(1)
+            .map(|item| (item.key.as_slice(), item))
+            .collect()
+    });
+
+    let mut ordered_keys: Vec<&[Segment]> = Vec::new();
+    let mut seen_keys: HashSet<&[Segment]> = HashSet::new();
+    for outline in outlines {
+        for item in outline.items().iter().skip(1) {
+            if item.signature.is_some() && seen_keys.insert(item.key.as_slice()) {
+                ordered_keys.push(item.key.as_slice());
+            }
+        }
+    }
+    if ordered_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let mut referencing: HashMap<&[Segment], Vec<usize>> = HashMap::new();
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let chunk_paths = chunk.item_paths();
+        let mut covered: HashSet<&[Segment]> = HashSet::new();
+        let mut names: HashSet<&str> = HashSet::new();
+
+        for version in MergeVersion::ALL {
+            let outline = analysis.outline(version);
+            let span = merge.bytes(version, chunk.lines(merge, version));
+            for name in outline.referenced_names(span.clone()) {
+                names.insert(name);
+            }
+            for item in outline.items().iter().skip(1) {
+                let inside_span = !span.is_empty()
+                    && !item.bytes.is_empty()
+                    && span.start <= item.bytes.start
+                    && item.bytes.end <= span.end;
+                if inside_span || chunk_paths.contains(&item.path) {
+                    covered.insert(item.key.as_slice());
+                }
+            }
+        }
+        if names.is_empty() {
+            continue;
+        }
+
+        let matched: HashSet<&[Segment]> = ordered_keys
+            .iter()
+            .copied()
+            .filter(|&key| !covered.contains(key))
+            .filter(|&key| {
+                by_key.iter().any(|side_map| {
+                    side_map.get(key).is_some_and(|item| {
+                        item.signature.is_some()
+                            && item
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| names.contains(name))
+                    })
+                })
+            })
+            .collect();
+
+        for &key in &matched {
+            let parent_already_hoisted = by_key.iter().zip(outlines).any(|(side_map, outline)| {
+                side_map
+                    .get(key)
+                    .and_then(|item| item.parent)
+                    .filter(|&parent| parent != Outline::ROOT)
+                    .map(|parent| outline.item(parent))
+                    .is_some_and(|parent| {
+                        parent.signature.is_some() && matched.contains(parent.key.as_slice())
+                    })
+            });
+            if !parent_already_hoisted {
+                referencing.entry(key).or_default().push(chunk_index);
+            }
+        }
+    }
+
+    ordered_keys
+        .into_iter()
+        .filter_map(|key| {
+            let chunks = referencing.remove(key)?;
+            let base_item = by_key[MergeVersion::Base as usize].get(key).copied();
+            let ours_item = by_key[MergeVersion::Ours as usize].get(key).copied();
+            let theirs_item = by_key[MergeVersion::Theirs as usize].get(key).copied();
+            let item = ours_item
+                .or(theirs_item)
+                .or(base_item)
+                .map(|item| item.path.clone())?;
+            let base = base_item.and_then(|item| item.signature.clone());
+            let ours = ours_item.and_then(|item| item.signature.clone());
+            let theirs = theirs_item.and_then(|item| item.signature.clone());
+            if base.is_some() && base == ours && base == theirs {
+                Some(SignatureState {
+                    item,
+                    signature: base,
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks,
+                })
+            } else {
+                Some(SignatureState {
+                    item,
+                    signature: None,
+                    base,
+                    ours,
+                    theirs,
+                    chunks,
+                })
+            }
+        })
+        .collect()
+}
+
+impl ChunkState {
+    fn new(merge: &LineMerge, chunk: &Chunk) -> Self {
+        let base = Version::new(merge, chunk, MergeVersion::Base, None);
+        let ours = Version::new(merge, chunk, MergeVersion::Ours, base.as_ref());
+        let theirs = Version::new(merge, chunk, MergeVersion::Theirs, base.as_ref());
+        let present = [base.is_some(), ours.is_some(), theirs.is_some()];
         Self {
-            summary: summary(conflict.kind, &node_type, &conflict.item),
-            item: conflict.item.clone(),
-            node_type,
+            summary: summary(
+                MergeVersion::ALL.map(|version| chunk.items(version)),
+                present,
+            ),
+            items: chunk.item_paths(),
             base,
             ours,
             theirs,
@@ -94,57 +279,97 @@ impl ConflictState {
 }
 
 impl Version {
-    fn new(source: &[u8], location: &Location, base: Option<&Version>) -> Self {
-        let code = snippet(source, &location.bytes);
+    fn new(
+        merge: &LineMerge,
+        chunk: &Chunk,
+        version: MergeVersion,
+        base: Option<&Version>,
+    ) -> Option<Self> {
+        let lines = chunk.lines(merge, version);
+        let blank = |line: usize| {
+            merge
+                .slice(version, line..line + 1)
+                .iter()
+                .all(u8::is_ascii_whitespace)
+        };
+        let first = lines.clone().find(|&line| !blank(line))?;
+        let last = lines.rev().find(|&line| !blank(line))?;
+        let text = String::from_utf8_lossy(merge.slice(version, first..last + 1));
+        let code = dedent(&text.replace("\r\n", "\n"));
         let changes = base
             .map(|base| diff(&base.code, &code))
             .filter(|changes| !changes.is_empty());
-        Self {
-            lines: location.lines.clone(),
+        Some(Self {
+            lines: first + 1..=last + 1,
             code,
             changes,
-        }
+        })
     }
 }
 
 // Modeled on the blueprint's example: "Node type `struct_item` 'User' in
 // Base had field 'x'. Branch A modified ... Branch B removed ...".
-fn summary(kind: ConflictKind, node_type: &str, item: &str) -> String {
-    let (base, ours, theirs) = match kind {
-        ConflictKind::BothModified => ("exists in base", "modified it", "modified it differently"),
-        ConflictKind::BothAdded => (
-            "does not exist in base",
-            "added it",
-            "added it with different content",
-        ),
-        ConflictKind::ModifiedInOursDeletedInTheirs => {
-            ("exists in base", "modified it", "deleted it")
-        }
-        ConflictKind::DeletedInOursModifiedInTheirs => {
-            ("exists in base", "deleted it", "modified it")
-        }
+fn summary(items: [&[ChunkItem]; 3], present: [bool; 3]) -> String {
+    fn paths(items: &[ChunkItem]) -> Vec<&str> {
+        items.iter().map(|item| item.path.as_str()).collect()
+    }
+    let mut versions = (0..3)
+        .filter(|&side| present[side])
+        .map(|side| paths(items[side]));
+    let first = versions.next().unwrap_or_default();
+    if first.is_empty() || versions.any(|other| other != first) {
+        let list = |side: usize| {
+            if present[side] && !items[side].is_empty() {
+                listing(items[side], |item| {
+                    format!("`{}` (`{}`)", item.path, item.node_kind)
+                })
+            } else {
+                "nothing".to_owned()
+            }
+        };
+        return format!(
+            "The chunk holds different items in each version. Base: {}. Ours: {}. Theirs: {}.",
+            list(0),
+            list(1),
+            list(2)
+        );
+    }
+
+    let subject = items[(0..3).find(|&side| present[side]).unwrap_or_default()];
+    let plural = subject.len() > 1;
+    let it = if plural { "them" } else { "it" };
+    let base = match (present[0], plural) {
+        (true, false) => "exists in base",
+        (true, true) => "exist in base",
+        (false, false) => "does not exist in base",
+        (false, true) => "do not exist in base",
     };
-    format!("Node type `{node_type}` `{item}` {base}. Ours {ours}. Theirs {theirs}.")
+    let action = |side_present: bool| match (present[0], side_present) {
+        (true, true) => "modified",
+        (true, false) => "deleted",
+        (false, true) => "added",
+        (false, false) => "did not add",
+    };
+    let (ours, theirs) = (action(present[1]), action(present[2]));
+    let theirs = match theirs {
+        "modified" if ours == "modified" => format!("modified {it} differently"),
+        "added" if ours == "added" => format!("added {it} with different content"),
+        theirs => format!("{theirs} {it}"),
+    };
+    let noun = if plural { "Node types" } else { "Node type" };
+    let subject = listing(subject, |item| {
+        format!("`{}` `{}`", item.node_kind, item.path)
+    });
+    format!("{noun} {subject} {base}. Ours {ours} {it}. Theirs {theirs}.")
 }
 
-// Starts at the beginning of the item's first line when only indentation
-// precedes the item, so every line keeps its indentation before dedenting.
-fn snippet(source: &[u8], bytes: &Range<usize>) -> String {
-    let end = bytes.end.min(source.len());
-    let start = bytes.start.min(end);
-    let line_start = source[..start]
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(0, |newline| newline + 1);
-    let start = if source[line_start..start]
-        .iter()
-        .all(|&byte| byte == b' ' || byte == b'\t')
-    {
-        line_start
-    } else {
-        start
-    };
-    dedent(&String::from_utf8_lossy(&source[start..end]).replace("\r\n", "\n"))
+fn listing(items: &[ChunkItem], describe: impl Fn(&ChunkItem) -> String) -> String {
+    let described: Vec<String> = items.iter().map(describe).collect();
+    match described.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 fn dedent(text: &str) -> String {
@@ -184,26 +409,26 @@ fn diff(old: &str, new: &str) -> String {
 
 impl fmt::Display for SemanticState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let count = self.conflicts.len();
+        let count = self.chunks.len();
         writeln!(
             formatter,
             "File `{}` ({}): {count} {} changed on both sides.",
             self.file,
             self.language,
-            if count == 1 { "item" } else { "items" }
+            if count == 1 { "chunk" } else { "chunks" }
         )?;
-        for (index, conflict) in self.conflicts.iter().enumerate() {
+        for (index, chunk) in self.chunks.iter().enumerate() {
             writeln!(formatter)?;
             writeln!(
                 formatter,
-                "Item {} of {count}: {}",
+                "Chunk {} of {count}: {}",
                 index + 1,
-                conflict.summary
+                chunk.summary
             )?;
             for (side, version) in [
-                ("Base", &conflict.base),
-                ("Ours", &conflict.ours),
-                ("Theirs", &conflict.theirs),
+                ("Base", &chunk.base),
+                ("Ours", &chunk.ours),
+                ("Theirs", &chunk.theirs),
             ] {
                 let Some(version) = version else {
                     writeln!(formatter, "{side}: not present")?;
@@ -219,6 +444,27 @@ impl fmt::Display for SemanticState {
                 if let Some(changes) = &version.changes {
                     writeln!(formatter, "{side} changes from base:")?;
                     write_indented(formatter, changes)?;
+                }
+            }
+        }
+        for signature in &self.signatures {
+            writeln!(formatter)?;
+            writeln!(formatter, "Referenced signature `{}`:", signature.item)?;
+            if let Some(code) = &signature.signature {
+                write_indented(formatter, code)?;
+            } else {
+                for (side, version) in [
+                    ("Base", &signature.base),
+                    ("Ours", &signature.ours),
+                    ("Theirs", &signature.theirs),
+                ] {
+                    match version {
+                        Some(code) => {
+                            writeln!(formatter, "{side}:")?;
+                            write_indented(formatter, code)?;
+                        }
+                        None => writeln!(formatter, "{side}: not present")?,
+                    }
                 }
             }
         }
@@ -240,7 +486,7 @@ fn write_indented(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast;
+    use crate::{ast, chunk, merge::Versions};
     use serde_json::json;
 
     const BASE: &str = "\
@@ -262,6 +508,7 @@ impl Counter {
             ours: ours.as_bytes().to_vec(),
             theirs: theirs.as_bytes().to_vec(),
         };
+        let merge = LineMerge::new(&versions).unwrap();
         let analysis = ast::analyze(
             Path::new(path),
             &versions.base,
@@ -269,11 +516,13 @@ impl Counter {
             &versions.theirs,
         )
         .unwrap();
-        SemanticState::new(Path::new(path), &analysis, &versions)
+        let chunks = chunk::chunks(&merge, Some(&analysis));
+        let decidable: Vec<&Chunk> = chunks.iter().filter(|chunk| chunk.decidable).collect();
+        SemanticState::new(Path::new(path), &analysis, &merge, &decidable)
     }
 
     #[test]
-    fn describes_an_item_modified_on_both_sides_as_plain_text() {
+    fn describes_a_chunk_modified_on_both_sides_as_plain_text() {
         let ours = BASE.replace("        self.value\n", "        self.value + 1\n");
         let theirs = BASE.replace(
             "        self.value\n",
@@ -285,9 +534,9 @@ impl Counter {
         assert_eq!(
             state.to_string(),
             "\
-File `src/counter.rs` (Rust): 1 item changed on both sides.
+File `src/counter.rs` (Rust): 1 chunk changed on both sides.
 
-Item 1 of 1: Node type `function_item` `impl Counter > fn get` exists in base. Ours modified it. Theirs modified it differently.
+Chunk 1 of 1: Node type `function_item` `impl Counter > fn get` exists in base. Ours modified it. Theirs modified it differently.
 Base, lines 6-9:
     /// Returns the value.
     fn get(&self) -> u32 {
@@ -335,9 +584,8 @@ Theirs changes from base:
             json!({
                 "file": "src/counter.rs",
                 "language": "Rust",
-                "conflicts": [{
-                    "item": "impl Counter > fn get",
-                    "node_type": "function_item",
+                "chunks": [{
+                    "items": ["impl Counter > fn get"],
                     "summary": "Node type `function_item` `impl Counter > fn get` exists in base. \
                                 Ours modified it. Theirs modified it differently.",
                     "base": {
@@ -368,15 +616,16 @@ Theirs changes from base:
         let deleted_in_ours = state("app.py", base, "", &modified);
         let deleted_in_theirs = state("app.py", base, &modified, "");
 
-        let conflict = &both_added.conflicts[0];
+        let chunk = &both_added.chunks[0];
+        assert_eq!(chunk.items, ["def gamma"]);
         assert_eq!(
-            conflict.summary,
+            chunk.summary,
             "Node type `function_definition` `def gamma` does not exist in base. \
              Ours added it. Theirs added it with different content."
         );
-        assert_eq!(conflict.base, None);
+        assert_eq!(chunk.base, None);
         assert_eq!(
-            conflict.ours,
+            chunk.ours,
             Some(Version {
                 lines: 5..=6,
                 code: "def gamma():\n    return 3".to_owned(),
@@ -384,7 +633,7 @@ Theirs changes from base:
             })
         );
         assert!(both_added.to_string().contains(
-            "Item 1 of 1: Node type `function_definition` `def gamma` does not exist in base. \
+            "Chunk 1 of 1: Node type `function_definition` `def gamma` does not exist in base. \
              Ours added it. Theirs added it with different content.\n\
              Base: not present\n\
              Ours, lines 5-6:\n    def gamma():\n        return 3\n\
@@ -392,23 +641,23 @@ Theirs changes from base:
         ));
 
         assert_eq!(
-            deleted_in_ours.conflicts[0].summary,
+            deleted_in_ours.chunks[0].summary,
             "Node type `function_definition` `def alpha` exists in base. \
              Ours deleted it. Theirs modified it."
         );
-        assert_eq!(deleted_in_ours.conflicts[0].ours, None);
+        assert_eq!(deleted_in_ours.chunks[0].ours, None);
         assert!(
             deleted_in_ours
                 .to_string()
                 .contains("\nOurs: not present\n")
         );
         assert_eq!(
-            deleted_in_theirs.conflicts[0].summary,
+            deleted_in_theirs.chunks[0].summary,
             "Node type `function_definition` `def alpha` exists in base. \
              Ours modified it. Theirs deleted it."
         );
         assert_eq!(
-            serde_json::to_value(&deleted_in_theirs).unwrap()["conflicts"][0]["theirs"],
+            serde_json::to_value(&deleted_in_theirs).unwrap()["chunks"][0]["theirs"],
             json!(null)
         );
     }
@@ -421,14 +670,14 @@ Theirs changes from base:
 
         let state = state("box.py", base, &ours, &theirs);
 
-        let conflict = &state.conflicts[0];
-        assert_eq!(conflict.item, "class Box > def size");
+        let chunk = &state.chunks[0];
+        assert_eq!(chunk.items, ["class Box > def size"]);
         assert_eq!(
-            conflict.base.as_ref().unwrap().code,
+            chunk.base.as_ref().unwrap().code,
             "def size(self):\n    if self.empty:\n        return 0\n    return self._size"
         );
         assert_eq!(
-            conflict.ours.as_ref().unwrap().changes.as_deref(),
+            chunk.ours.as_ref().unwrap().changes.as_deref(),
             Some(
                 "@@ -1,4 +1,4 @@\n def size(self):\n     if self.empty:\n\
                  -        return 0\n+        return -1\n     return self._size"
@@ -437,7 +686,7 @@ Theirs changes from base:
     }
 
     #[test]
-    fn keeps_items_in_analysis_order_and_is_deterministic() {
+    fn keeps_chunks_in_file_order_and_is_deterministic() {
         let base = "fn alpha() -> u32 {\n    1\n}\n\nfn beta() -> u32 {\n    2\n}\n";
         let ours = base
             .replace("    1\n", "    10\n")
@@ -452,15 +701,223 @@ Theirs changes from base:
         assert_eq!(first, second);
         assert_eq!(first.to_string(), second.to_string());
         let items: Vec<_> = first
-            .conflicts
+            .chunks
             .iter()
-            .map(|conflict| conflict.item.as_str())
+            .map(|chunk| chunk.items.clone())
             .collect();
-        assert_eq!(items, ["fn alpha", "fn beta"]);
-        assert!(
-            first.to_string().starts_with(
-                "File `lib.rs` (Rust): 2 items changed on both sides.\n\nItem 1 of 2: "
+        assert_eq!(items, [["fn alpha"], ["fn beta"]]);
+        assert!(first.to_string().starts_with(
+            "File `lib.rs` (Rust): 2 chunks changed on both sides.\n\nChunk 1 of 2: "
+        ));
+    }
+
+    #[test]
+    fn describes_chunks_of_several_items_and_items_that_differ_between_versions() {
+        let base = "fn alpha() -> u32 { 1 }\nfn beta() -> u32 { 2 }\n";
+        let ours = base.replace("{ 1 }", "{ 10 }").replace("{ 2 }", "{ 20 }");
+        let theirs = base.replace("{ 1 }", "{ 11 }").replace("{ 2 }", "{ 22 }");
+        assert_eq!(
+            state("lib.rs", base, &ours, &theirs).chunks[0].summary,
+            "Node types `function_item` `fn alpha` and `function_item` `fn beta` exist in \
+             base. Ours modified them. Theirs modified them differently."
+        );
+
+        let renamed = |name: &str| {
+            base.replace(
+                "fn beta() -> u32 { 2 }",
+                &format!("fn {name}() -> u32 {{ 2 }}"),
             )
+        };
+        let chunk = &state("lib.rs", base, &renamed("gamma"), &renamed("delta")).chunks[0];
+        assert_eq!(chunk.items, ["fn beta", "fn gamma", "fn delta"]);
+        assert_eq!(
+            chunk.summary,
+            "The chunk holds different items in each version. Base: `fn beta` \
+             (`function_item`). Ours: `fn gamma` (`function_item`). Theirs: `fn delta` \
+             (`function_item`)."
+        );
+    }
+
+    #[test]
+    fn leaves_blank_lines_around_a_chunk_out_of_its_code() {
+        let base = "def alpha():\n    return 1\n";
+        let added = |value: &str| format!("{base}\n\ndef gamma():\n    return {value}\n\n\n");
+
+        let state = state("app.py", base, &added("3"), &added("4"));
+
+        let ours = state.chunks[0].ours.as_ref().unwrap();
+        assert_eq!(ours.code, "def gamma():\n    return 3");
+        assert_eq!(ours.lines, 5..=6);
+    }
+
+    #[test]
+    fn hoists_referenced_rust_signatures_once_per_state_and_tracks_changed_types() {
+        let base = "\
+struct Id(u64);
+
+struct User {
+    x: u32,
+}
+
+trait Store {
+    fn load(&self, id: u64) -> User;
+    fn default_x(&self) -> u32 {
+        0
+    }
+}
+
+/// Doubles `value`.
+fn helper(value: u32) -> u32 {
+    let _ = Id(1);
+    value * 2
+}
+
+fn first(user: &User, store: &dyn Store) -> u32 {
+    let _ = store;
+    helper(user.x)
+}
+
+fn second(user: &User) -> u32 {
+    helper(user.x + 1)
+}
+";
+        let ours = base
+            .replace("x: u32,", "x: i32,")
+            .replace("helper(user.x)", "helper(user.x as u32 + 10)")
+            .replace("helper(user.x + 1)", "helper(user.x as u32 + 20)");
+        let theirs = base
+            .replace("helper(user.x)", "helper(user.x + 100)")
+            .replace("helper(user.x + 1)", "helper(user.x + 200)");
+
+        let state = state("src/lib.rs", base, &ours, &theirs);
+
+        // `Id` is referenced only inside `helper`, so one-level lookup leaves it out.
+        assert_eq!(
+            state.signatures,
+            [
+                SignatureState {
+                    item: "struct User".to_owned(),
+                    signature: None,
+                    base: Some("struct User {\n    x: u32,\n}".to_owned()),
+                    ours: Some("struct User {\n    x: i32,\n}".to_owned()),
+                    theirs: Some("struct User {\n    x: u32,\n}".to_owned()),
+                    chunks: vec![0, 1],
+                },
+                SignatureState {
+                    item: "trait Store".to_owned(),
+                    signature: Some(
+                        "trait Store {\n    fn load(&self, id: u64) -> User;\n    \
+                         fn default_x(&self) -> u32;\n}"
+                            .to_owned()
+                    ),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "fn helper".to_owned(),
+                    signature: Some(
+                        "/// Doubles `value`.\nfn helper(value: u32) -> u32".to_owned()
+                    ),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0, 1],
+                },
+            ]
+        );
+        let chunk_1_items: Vec<&str> = state
+            .signatures_for_chunk(1)
+            .map(|sig| sig.item.as_str())
+            .collect();
+        assert_eq!(chunk_1_items, ["struct User", "fn helper"]);
+        assert!(state.to_string().contains(
+            "Referenced signature `struct User`:\n\
+             Base:\n    struct User {\n        x: u32,\n    }\n\
+             Ours:\n    struct User {\n        x: i32,\n    }\n\
+             Theirs:\n    struct User {\n        x: u32,\n    }\n\n\
+             Referenced signature `trait Store`:\n    \
+             trait Store {\n        fn load(&self, id: u64) -> User;\n        \
+             fn default_x(&self) -> u32;\n    }\n\n\
+             Referenced signature `fn helper`:\n    \
+             /// Doubles `value`.\n    fn helper(value: u32) -> u32\n"
+        ));
+    }
+
+    #[test]
+    fn hoists_referenced_python_class_and_function_signatures_one_level_deep() {
+        let base = "\
+def ignored_leaf(x: int) -> int:
+    return x
+
+
+def clamp(amount: int) -> int:
+    return ignored_leaf(max(0, amount))
+
+
+class Account:
+    currency: str = \"USD\"
+
+    def __init__(self, balance: int) -> None:
+        self.balance = balance
+
+    @property
+    def available(self) -> int:
+        return self.balance
+
+
+def withdraw(account: Account, amount: int) -> int:
+    return account.available - clamp(amount)
+";
+        let ours = base.replace(
+            "return account.available - clamp(amount)",
+            "return max(0, account.available - clamp(amount))",
+        );
+        let theirs = base
+            .replace("currency: str = \"USD\"", "currency: str = \"EUR\"")
+            .replace(
+                "return account.available - clamp(amount)",
+                "return account.available - clamp(amount + 1)",
+            );
+
+        let state = state("app.py", base, &ours, &theirs);
+
+        assert_eq!(
+            state.signatures,
+            [
+                SignatureState {
+                    item: "def clamp".to_owned(),
+                    signature: Some("def clamp(amount: int) -> int:".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "class Account".to_owned(),
+                    signature: None,
+                    base: Some(
+                        "class Account:\n    currency: str = \"USD\"\n    \
+                         def __init__(self, balance: int) -> None:\n    \
+                         @property\n    def available(self) -> int:"
+                            .to_owned()
+                    ),
+                    ours: Some(
+                        "class Account:\n    currency: str = \"USD\"\n    \
+                         def __init__(self, balance: int) -> None:\n    \
+                         @property\n    def available(self) -> int:"
+                            .to_owned()
+                    ),
+                    theirs: Some(
+                        "class Account:\n    currency: str = \"EUR\"\n    \
+                         def __init__(self, balance: int) -> None:\n    \
+                         @property\n    def available(self) -> int:"
+                            .to_owned()
+                    ),
+                    chunks: vec![0],
+                },
+            ]
         );
     }
 }
