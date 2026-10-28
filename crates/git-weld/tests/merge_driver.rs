@@ -1702,6 +1702,7 @@ fn cargo_manifest_declares_binstall_packaging_metadata() {
         .find(|pkg| pkg["name"] == "git-weld")
         .expect("git-weld package metadata");
 
+    assert_eq!(package["license"], json!("MIT"));
     assert_eq!(
         package["repository"],
         json!("https://github.com/giripriyadarshan/git-weld")
