@@ -32,9 +32,9 @@ pre-release-hook = [
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.60.2", default-features = false }
 reqwest = "0.13"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
