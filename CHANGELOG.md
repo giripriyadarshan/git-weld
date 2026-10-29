@@ -2,6 +2,16 @@
 
 All notable changes to `git-weld` are documented in this file.
 
+## [0.1.0-rc.3] - 2026-10-29
+
+### Features
+
+- Add dependency security audit gates and remediate lockfile advisories (a69f924)
+
+### Miscellaneous
+
+- Update jsonschema and rusqlite workspace dependencies (d215dbc)
+
 ## [0.1.0-rc.2] - 2026-10-29
 
 ### Features
