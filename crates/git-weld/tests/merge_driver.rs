@@ -1724,3 +1724,117 @@ fn cargo_manifest_declares_binstall_packaging_metadata() {
         })
     );
 }
+
+#[test]
+fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(workspace_root.join("Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        metadata["metadata"]["release"],
+        json!({
+            "shared-version": true,
+            "publish": false,
+            "allow-branch": ["main"],
+            "consolidate-commits": true,
+            "pre-release-commit-message": "Prepare v{{version}}",
+            "tag-name": "v{{version}}",
+            "tag-message": "v{{version}}",
+            "pre-release-hook": [
+                "git-cliff",
+                "--workdir",
+                "../..",
+                "--config",
+                "cliff.toml",
+                "-o",
+                "../../CHANGELOG.md",
+                "--tag",
+                "v{{version}}",
+            ],
+        })
+    );
+
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pkg| pkg["name"] == "git-weld")
+        .expect("git-weld package metadata");
+    assert_eq!(package["metadata"]["release"], Value::Null);
+
+    let cliff_toml = fs::read_to_string(workspace_root.join("cliff.toml")).unwrap();
+    assert!(
+        cliff_toml.contains(r#"{ message = "^Prepare v", skip = true }"#),
+        "cliff.toml must skip cargo-release preparation commits"
+    );
+    assert!(
+        cliff_toml.contains(r#"tag_pattern = "^v[0-9].*""#),
+        "cliff.toml must match v<version> tags"
+    );
+
+    let changelog = fs::read_to_string(workspace_root.join("CHANGELOG.md")).unwrap();
+    assert!(
+        changelog.contains("## [0.1.0-rc.1]"),
+        "CHANGELOG.md must include the v0.1.0-rc.1 section"
+    );
+    assert!(
+        !changelog.contains("Prepare v0.1.0-rc.1"),
+        "CHANGELOG.md must exclude release preparation commits"
+    );
+
+    let release_workflow =
+        fs::read_to_string(workspace_root.join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        release_workflow.contains("fetch-depth: 0"),
+        "release workflow must fetch full git history for git-cliff"
+    );
+    assert!(
+        release_workflow.contains("--notes-file RELEASE_NOTES.md"),
+        "release workflow must publish git-cliff release notes"
+    );
+    assert!(
+        release_workflow.contains("needs: release"),
+        "publish job must stay gated behind GitHub Release packaging (ADR-0003)"
+    );
+
+    let mut prose_files = vec![
+        workspace_root.join("README.md"),
+        workspace_root.join("CONTRIBUTING.md"),
+        workspace_root.join("CODING_STANDARDS.md"),
+        workspace_root.join("GLOSSARY.md"),
+        workspace_root.join("CHANGELOG.md"),
+        workspace_root.join("cliff.toml"),
+        workspace_root.join(".github/workflows/release.yml"),
+    ];
+    for entry in fs::read_dir(workspace_root.join("docs/adr")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            prose_files.push(path);
+        }
+    }
+    for path in prose_files {
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains('\u{2014}') && !content.contains('\u{2013}'),
+            "{} must not contain em dashes or en dashes",
+            path.display()
+        );
+    }
+}
