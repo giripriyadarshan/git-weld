@@ -10,8 +10,21 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit dependencies with cargo-audit
+        run: cargo audit --deny warnings
+
   package:
     name: Package (${{ matrix.target }})
+    needs: audit
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

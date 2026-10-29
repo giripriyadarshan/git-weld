@@ -50,13 +50,15 @@ Use the exact terms defined in [`GLOSSARY.md`](GLOSSARY.md) in types, identifier
 ## 5. Prose and Documentation Style
 
 - **No em dashes or en dashes.** Never use the em dash (`U+2014`) or en dash (`U+2013`) in documentation, comments, commit messages, or diagnostics. Use colons, semicolons, parentheses, commas, or separate sentences instead.
-- **Required verification.** Every change must pass all three checks in [`CONTRIBUTING.md`](CONTRIBUTING.md):
+- **Required verification.** Every change must pass all four checks in [`CONTRIBUTING.md`](CONTRIBUTING.md):
   - `cargo fmt --all -- --check`
   - `cargo clippy --workspace --all-targets --locked -- -D warnings`
   - `cargo test --workspace --locked`
+  - `cargo audit --deny warnings`
 
 ## 6. Release and Changelog Discipline ([ADR-0003](docs/adr/0003-ci-gated-crates-io-publishing.md))
 
+- **Audit dependencies before and without releasing.** `.github/workflows/ci.yml` must run a `security-audit` job (`cargo audit --deny warnings`, plus `actions/dependency-review-action` on pull requests) on `push`, `pull_request`, `workflow_dispatch`, and a daily `schedule` so `Cargo.lock` advisories and GitHub Advisory Database findings can be audited continuously and on demand without cutting a release. `.github/workflows/release.yml` must also gate `package` behind an `audit` job (`cargo audit --deny warnings`) so a release tag with known vulnerabilities or unsoundness warnings is never packaged or published.
 - **Never run `cargo publish` locally during release preparation.** `[workspace.metadata.release]` in `Cargo.toml` must keep `publish = false` so `cargo-release` only updates the workspace version, runs `git-cliff` to update `CHANGELOG.md`, commits `Prepare v<version>`, and pushes the `v<version>` tag. Crates.io publishing is gated behind the `release` job in `.github/workflows/release.yml` so `cargo-binstall` binary archives are always live on GitHub Releases before the crate version appears on crates.io.
 - **Single source of truth for release notes.** `cliff.toml` governs both the committed `CHANGELOG.md` (via `cargo-release`'s `pre-release-hook`) and the GitHub Release notes generated in `.github/workflows/release.yml` (`git-cliff --current --strip all`). Keep `cliff.toml` templates and commit parsers free of em dashes and en dashes.
 

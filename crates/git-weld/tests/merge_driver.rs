@@ -1799,8 +1799,30 @@ fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
         "CHANGELOG.md must exclude release preparation commits"
     );
 
+    let ci_workflow = fs::read_to_string(workspace_root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        ci_workflow.contains("workflow_dispatch:") && ci_workflow.contains("schedule:"),
+        "ci workflow must support on-demand and scheduled runs"
+    );
+    assert!(
+        ci_workflow.contains("actions/dependency-review-action"),
+        "ci workflow must review dependency changes on pull requests"
+    );
+    assert!(
+        ci_workflow.contains("cargo audit --deny warnings"),
+        "ci workflow must audit dependencies with cargo-audit"
+    );
+
     let release_workflow =
         fs::read_to_string(workspace_root.join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        release_workflow.contains("cargo audit --deny warnings"),
+        "release workflow must audit dependencies before packaging"
+    );
+    assert!(
+        release_workflow.contains("needs: audit"),
+        "package job must stay gated behind security audit"
+    );
     assert!(
         release_workflow.contains("fetch-depth: 0"),
         "release workflow must fetch full git history for git-cliff"
@@ -1814,6 +1836,18 @@ fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
         "publish job must stay gated behind GitHub Release packaging (ADR-0003)"
     );
 
+    let contributing = fs::read_to_string(workspace_root.join("CONTRIBUTING.md")).unwrap();
+    assert!(
+        contributing.contains("cargo audit --deny warnings"),
+        "CONTRIBUTING.md must require cargo audit --deny warnings"
+    );
+
+    let coding_standards = fs::read_to_string(workspace_root.join("CODING_STANDARDS.md")).unwrap();
+    assert!(
+        coding_standards.contains("cargo audit --deny warnings"),
+        "CODING_STANDARDS.md must require cargo audit --deny warnings"
+    );
+
     let mut prose_files = vec![
         workspace_root.join("README.md"),
         workspace_root.join("CONTRIBUTING.md"),
@@ -1821,6 +1855,7 @@ fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
         workspace_root.join("GLOSSARY.md"),
         workspace_root.join("CHANGELOG.md"),
         workspace_root.join("cliff.toml"),
+        workspace_root.join(".github/workflows/ci.yml"),
         workspace_root.join(".github/workflows/release.yml"),
     ];
     for entry in fs::read_dir(workspace_root.join("docs/adr")).unwrap() {

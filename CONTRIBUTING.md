@@ -2,12 +2,13 @@
 
 ## Checks
 
-CI runs these three commands, and every change should pass them locally:
+CI runs these four commands, and every change should pass them locally:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+cargo audit --deny warnings
 ```
 
 The tests need Git, because some of them run real `git merge` commands in
@@ -155,8 +156,12 @@ Releases are prepared locally with [`cargo-release`](https://github.com/crate-ci
 1. **Configure local release preparation (`[workspace.metadata.release]` in `Cargo.toml` and `cliff.toml`):**
    - `cargo-release` shares the workspace version (`shared-version = true`), disables local crates.io publishing (`publish = false`), formats tags as `v{{version}}`, commits with `Prepare v{{version}}`, and runs `git-cliff --workdir ../.. --config cliff.toml -o ../../CHANGELOG.md --tag v{{version}}` as its `pre-release-hook`.
    - `cliff.toml` parses both Conventional Commits (`feat:`, `fix:`, `doc:`, `perf:`, `refactor:`, `test:`, `chore:`) and `git-weld`'s imperative commit subjects (`Add ...`, `Implement ...`, `Fix ...`, `Document ...`) while skipping release-preparation commits (`Prepare v*`, `chore(release):*`) and bootstrap noise.
-2. **Preview and execute the release bump:**
+2. **Verify dependency security and preview the release bump:**
    ```sh
+   # Verify zero RustSec vulnerabilities/warnings and zero open Dependabot alerts before releasing
+   cargo audit --deny warnings
+   gh api repos/giripriyadarshan/git-weld/dependabot/alerts --jq 'map(select(.state == "open")) | length'
+
    # Preview version bump and CHANGELOG.md generation (dry run), then restore CHANGELOG.md
    cargo release <rc|release|patch|minor|major>
    git checkout CHANGELOG.md
@@ -165,7 +170,8 @@ Releases are prepared locally with [`cargo-release`](https://github.com/crate-ci
    cargo release <rc|release|patch|minor|major> --execute
    ```
 3. **Automated CI packaging and publishing (`.github/workflows/release.yml`):**
-   - Pushing a `v*` tag triggers the `package` matrix job, which verifies that `GITHUB_REF_NAME` matches `Cargo.toml`, builds release archives across all 7 targets, and tests each archive offline with `cargo-binstall`.
+   - Pushing a `v*` tag triggers the `audit` job (`cargo audit --deny warnings`), which gates the entire workflow so a tag with known lockfile vulnerabilities or unsoundness warnings cannot be packaged or published.
+   - Once `audit` succeeds, the `package` matrix job verifies that `GITHUB_REF_NAME` matches `Cargo.toml`, builds release archives across all 7 targets, and tests each archive offline with `cargo-binstall`.
    - Once all target archives succeed, the `release` job aggregates `SHA256SUMS`, extracts the current version's section with `git-cliff --tag "${GITHUB_REF_NAME}" --current --strip all`, and creates the GitHub Release (marking pre-release tags containing `-` with `--prerelease`).
    - Finally, the `publish` job authenticates with crates.io using OIDC Trusted Publishing (`rust-lang/crates-io-auth-action@v1`) and runs `cargo publish --locked --package git-weld` only after the GitHub Release assets required by `cargo-binstall` are live.
 
