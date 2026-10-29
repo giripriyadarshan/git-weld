@@ -1,6 +1,6 @@
 # Coding Standards
 
-These standards govern code changes, reviews, and documentation in `git-weld`. Read [`GLOSSARY.md`](GLOSSARY.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/adr/0001-same-file-signature-hoisting.md`](docs/adr/0001-same-file-signature-hoisting.md), and [`docs/adr/0002-sqlite-decision-cache.md`](docs/adr/0002-sqlite-decision-cache.md) alongside this file.
+These standards govern code changes, reviews, and documentation in `git-weld`. Read [`GLOSSARY.md`](GLOSSARY.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/adr/0001-same-file-signature-hoisting.md`](docs/adr/0001-same-file-signature-hoisting.md), [`docs/adr/0002-sqlite-decision-cache.md`](docs/adr/0002-sqlite-decision-cache.md), and [`docs/adr/0003-ci-gated-crates-io-publishing.md`](docs/adr/0003-ci-gated-crates-io-publishing.md) alongside this file.
 
 ## 1. Fail-Safe Manual Fallback Invariant
 
@@ -54,3 +54,9 @@ Use the exact terms defined in [`GLOSSARY.md`](GLOSSARY.md) in types, identifier
   - `cargo fmt --all -- --check`
   - `cargo clippy --workspace --all-targets --locked -- -D warnings`
   - `cargo test --workspace --locked`
+
+## 6. Release and Changelog Discipline ([ADR-0003](docs/adr/0003-ci-gated-crates-io-publishing.md))
+
+- **Never run `cargo publish` locally during release preparation.** `[workspace.metadata.release]` in `Cargo.toml` must keep `publish = false` so `cargo-release` only updates the workspace version, runs `git-cliff` to update `CHANGELOG.md`, commits `Prepare v<version>`, and pushes the `v<version>` tag. Crates.io publishing is gated behind the `release` job in `.github/workflows/release.yml` so `cargo-binstall` binary archives are always live on GitHub Releases before the crate version appears on crates.io.
+- **Single source of truth for release notes.** `cliff.toml` governs both the committed `CHANGELOG.md` (via `cargo-release`'s `pre-release-hook`) and the GitHub Release notes generated in `.github/workflows/release.yml` (`git-cliff --current --strip all`). Keep `cliff.toml` templates and commit parsers free of em dashes and en dashes.
+

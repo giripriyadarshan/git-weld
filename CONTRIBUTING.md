@@ -147,3 +147,25 @@ Tests must not reach the network or need real credentials.
 Add a row to the Providers table in the README with the provider's
 settings and their defaults, and say what leaves the machine: with any
 remote provider, the code of every conflicting chunk is sent to it.
+
+## Releasing
+
+Releases are prepared locally with [`cargo-release`](https://github.com/crate-ci/cargo-release) and [`git-cliff`](https://github.com/orhun/git-cliff) and published by `.github/workflows/release.yml` ([ADR-0003](docs/adr/0003-ci-gated-crates-io-publishing.md)):
+
+1. **Configure local release preparation (`[workspace.metadata.release]` in `Cargo.toml` and `cliff.toml`):**
+   - `cargo-release` shares the workspace version (`shared-version = true`), disables local crates.io publishing (`publish = false`), formats tags as `v{{version}}`, commits with `Prepare v{{version}}`, and runs `git-cliff --workdir ../.. --config cliff.toml -o ../../CHANGELOG.md --tag v{{version}}` as its `pre-release-hook`.
+   - `cliff.toml` parses both Conventional Commits (`feat:`, `fix:`, `doc:`, `perf:`, `refactor:`, `test:`, `chore:`) and `git-weld`'s imperative commit subjects (`Add ...`, `Implement ...`, `Fix ...`, `Document ...`) while skipping release-preparation commits (`Prepare v*`, `chore(release):*`) and bootstrap noise.
+2. **Preview and execute the release bump:**
+   ```sh
+   # Preview version bump and CHANGELOG.md generation (dry run), then restore CHANGELOG.md
+   cargo release <rc|release|patch|minor|major>
+   git checkout CHANGELOG.md
+
+   # Apply the bump, update CHANGELOG.md, commit, tag v<version>, and push
+   cargo release <rc|release|patch|minor|major> --execute
+   ```
+3. **Automated CI packaging and publishing (`.github/workflows/release.yml`):**
+   - Pushing a `v*` tag triggers the `package` matrix job, which verifies that `GITHUB_REF_NAME` matches `Cargo.toml`, builds release archives across all 7 targets, and tests each archive offline with `cargo-binstall`.
+   - Once all target archives succeed, the `release` job aggregates `SHA256SUMS`, extracts the current version's section with `git-cliff --tag "${GITHUB_REF_NAME}" --current --strip all`, and creates the GitHub Release (marking pre-release tags containing `-` with `--prerelease`).
+   - Finally, the `publish` job authenticates with crates.io using OIDC Trusted Publishing (`rust-lang/crates-io-auth-action@v1`) and runs `cargo publish --locked --package git-weld` only after the GitHub Release assets required by `cargo-binstall` are live.
+

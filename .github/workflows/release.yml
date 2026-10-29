@@ -226,6 +226,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
 
       - name: Download packaged release assets
         uses: actions/download-artifact@v8
@@ -239,10 +244,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          git-cliff --config cliff.toml --tag "${GITHUB_REF_NAME}" --current --strip all -o release-assets/RELEASE_NOTES.md
+          if [[ ! -s release-assets/RELEASE_NOTES.md ]]; then
+            git-cliff --config cliff.toml --tag "${GITHUB_REF_NAME}" --unreleased --strip all -o release-assets/RELEASE_NOTES.md
+          fi
           cd release-assets
           cat ./*.sha256 | sort -k 2 > SHA256SUMS
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" ./*.tgz ./*.zip ./*.sha256 SHA256SUMS --clobber
+            gh release edit "${GITHUB_REF_NAME}" --notes-file RELEASE_NOTES.md
           else
             prerelease_args=()
             if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
@@ -250,7 +260,7 @@ jobs:
             fi
             gh release create "${GITHUB_REF_NAME}" ./*.tgz ./*.zip ./*.sha256 SHA256SUMS \
               --title "${GITHUB_REF_NAME}" \
-              --generate-notes \
+              --notes-file RELEASE_NOTES.md \
               --verify-tag \
               "${prerelease_args[@]}"
           fi

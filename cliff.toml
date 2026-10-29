@@ -1,0 +1,53 @@
+[changelog]
+header = """
+# Changelog
+
+All notable changes to `git-weld` are documented in this file.
+"""
+body = """
+
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim }}
+    {% for commit in commits %}
+        - {% if commit.scope %}**({{ commit.scope }})** {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | split(pat="\n") | first | upper_first | trim }} ({{ commit.id | truncate(length=7, end="") }})\
+    {% endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "^v[0-9].*"
+sort_commits = "oldest"
+commit_parsers = [
+  { message = "^Prepare v", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^phase [0-9]+", skip = true },
+  { message = "^init$", skip = true },
+  { message = "^CI checks pass", skip = true },
+  { message = "^Qodana config", skip = true },
+  { message = "^docs?(\\([^)]+\\))?:", group = "Documentation" },
+  { message = "^(Add|Update|Document) [^\\n]*(README|CONTRIBUTING|GLOSSARY|CODING_STANDARDS|glossary|decision record)", group = "Documentation" },
+  { message = "^feat(\\([^)]+\\))?:", group = "Features" },
+  { message = "^(Add|Implement|Support) ", group = "Features" },
+  { message = "^fix(\\([^)]+\\))?:", group = "Bug Fixes" },
+  { message = "^Fix ", group = "Bug Fixes" },
+  { message = "^perf(\\([^)]+\\))?:", group = "Performance" },
+  { message = "^refactor(\\([^)]+\\))?:", group = "Refactoring" },
+  { message = "^(Refactor|Simplify|Deduplicate) ", group = "Refactoring" },
+  { message = "^test(\\([^)]+\\))?:", group = "Testing" },
+  { message = "^ci(\\([^)]+\\))?:", group = "CI and Packaging" },
+  { message = ".*", group = "Miscellaneous" },
+]
