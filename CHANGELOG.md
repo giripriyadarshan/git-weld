@@ -2,6 +2,13 @@
 
 All notable changes to `git-weld` are documented in this file.
 
+## [0.1.0-rc.2] - 2026-10-29
+
+### Features
+
+- Add git-cliff changelog and GitHub Release notes workflow (8ec9640)
+- Add cargo-release configuration and ADR-0003 guardrail tests (662fd27)
+
 ## [0.1.0-rc.1] - 2026-10-29
 
 ### Documentation
