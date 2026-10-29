@@ -287,6 +287,32 @@ impl<'a> LineMerge<'a> {
         )
     }
 
+    /// The 0-based, half-open line range in `version` covered by `regions`.
+    pub fn span_lines(&self, version: Version, regions: Range<usize>) -> Range<usize> {
+        self.boundary(version, regions.start)..self.boundary(version, regions.end)
+    }
+
+    /// The byte range in `version` covered by `regions`.
+    pub fn span_bytes(&self, version: Version, regions: Range<usize>) -> Range<usize> {
+        self.bytes(version, self.span_lines(version, regions))
+    }
+
+    /// The bytes of `regions` in `version`.
+    pub fn span_slice(&self, version: Version, regions: Range<usize>) -> &'a [u8] {
+        &self.text(version)[self.span_bytes(version, regions)]
+    }
+
+    /// The byte range of the full lines in `version` that enclose `bytes`, or
+    /// `bytes.start..bytes.start` when `bytes` is empty.
+    pub fn line_span_bytes(&self, version: Version, bytes: Range<usize>) -> Range<usize> {
+        if bytes.is_empty() {
+            return bytes.start..bytes.start;
+        }
+        let first = self.line_at(version, bytes.start);
+        let last = self.line_at(version, bytes.end - 1);
+        self.bytes(version, first..last + 1)
+    }
+
     /// Writes the merged file. Each span that takes a side is written as that
     /// side's lines; every other conflict is written as `conflicts` says.
     /// `spans` must be sorted and must not overlap.
@@ -305,11 +331,7 @@ impl<'a> LineMerge<'a> {
             };
             let start = writer.position();
             match span.take {
-                Some(version) => writer.write(self.slice(
-                    version,
-                    self.boundary(version, span.regions.start)
-                        ..self.boundary(version, span.regions.end),
-                )),
+                Some(version) => writer.write(self.span_slice(version, span.regions.clone())),
                 None => {
                     for region in &self.regions[span.regions.clone()] {
                         markers += self.write_region(&mut writer, region, conflicts);
@@ -730,6 +752,75 @@ mod tests {
     }
 
     #[test]
+    fn translates_region_spans_and_enclosing_lines_across_versions() {
+        let empty = versions("", "", "");
+        let empty_merge = LineMerge::new(&empty).unwrap();
+        for version in Version::ALL {
+            assert_eq!(empty_merge.span_lines(version, 0..0), 0..0);
+            assert_eq!(empty_merge.span_bytes(version, 0..0), 0..0);
+            assert_eq!(empty_merge.span_slice(version, 0..0), b"");
+            assert_eq!(empty_merge.line_span_bytes(version, 0..0), 0..0);
+        }
+
+        let single = versions("solo", "solo", "solo");
+        let single_merge = LineMerge::new(&single).unwrap();
+        for version in Version::ALL {
+            assert_eq!(single_merge.span_lines(version, 0..1), 0..1);
+            assert_eq!(single_merge.span_bytes(version, 0..1), 0..4);
+            assert_eq!(single_merge.span_slice(version, 0..1), b"solo");
+            assert_eq!(single_merge.span_lines(version, 1..1), 1..1);
+            assert_eq!(single_merge.span_bytes(version, 1..1), 4..4);
+            assert_eq!(single_merge.span_slice(version, 1..1), b"");
+            assert_eq!(single_merge.line_span_bytes(version, 1..3), 0..4);
+            assert_eq!(single_merge.line_span_bytes(version, 4..4), 4..4);
+        }
+
+        let multi = versions("α\nβ\r\nδ\nγ", "α\nβ_ours\r\nδ\nγ", "α\nβ\r\nδ\nγ_theirs");
+        let merge = LineMerge::new(&multi).unwrap();
+        let region_count = merge.regions().len();
+        assert_eq!(region_count, 4);
+
+        // Region 0 is `"α\n"` (3 bytes: 2-byte UTF-8 `'α'` + `'\n'`).
+        // Region 1 is `"β_ours\r\n"` in ours (9 bytes) and `"β\r\n"` in base/theirs (4 bytes).
+        // Region 2 is `"δ\n"` (3 bytes).
+        // Region 3 is `"γ"` in base/ours (2 bytes, no trailing newline) and `"γ_theirs"` in theirs (9 bytes).
+        assert_eq!(merge.span_lines(Version::Ours, 0..2), 0..2);
+        assert_eq!(merge.span_bytes(Version::Ours, 0..2), 0..12);
+        assert_eq!(
+            merge.span_slice(Version::Ours, 0..2),
+            "α\nβ_ours\r\n".as_bytes()
+        );
+        assert_eq!(merge.span_lines(Version::Theirs, 1..4), 1..4);
+        assert_eq!(merge.span_bytes(Version::Theirs, 1..4), 3..19);
+        assert_eq!(
+            merge.span_slice(Version::Theirs, 1..4),
+            "β\r\nδ\nγ_theirs".as_bytes()
+        );
+        assert_eq!(
+            merge.span_lines(Version::Base, region_count..region_count),
+            4..4
+        );
+        assert_eq!(
+            merge.span_bytes(Version::Base, region_count..region_count),
+            12..12
+        );
+        assert_eq!(
+            merge.span_slice(Version::Base, region_count..region_count),
+            b""
+        );
+
+        // `line_span_bytes` widens interior byte offsets (including inside multi-byte
+        // UTF-8 characters and on lines without trailing newlines) to full lines.
+        assert_eq!(merge.line_span_bytes(Version::Ours, 1..2), 0..3);
+        assert_eq!(merge.line_span_bytes(Version::Ours, 1..5), 0..12);
+        assert_eq!(merge.line_span_bytes(Version::Ours, 15..16), 15..17);
+        assert_eq!(merge.line_span_bytes(Version::Theirs, 13..19), 10..19);
+        assert_eq!(merge.line_span_bytes(Version::Theirs, 10..10), 10..10);
+        let reversed = std::hint::black_box(5)..std::hint::black_box(2);
+        assert_eq!(merge.line_span_bytes(Version::Theirs, reversed), 5..5);
+    }
+
+    #[test]
     fn writes_spans_from_the_side_they_take_and_reports_where_they_landed() {
         let versions = versions_with_two_conflicts();
         let merge = LineMerge::new(&versions).unwrap();
@@ -850,6 +941,54 @@ mod tests {
                 merge.render(&[], Conflicts::Fill(Version::Ours)).text,
                 "{texts:?}"
             );
+
+            let region_count = merge.regions().len();
+            for version in Version::ALL {
+                let text = merge.text(version);
+                assert_eq!(
+                    merge.span_lines(version, 0..region_count),
+                    0..merge.line_count(version)
+                );
+                assert_eq!(merge.span_bytes(version, 0..region_count), 0..text.len());
+                assert_eq!(merge.span_slice(version, 0..region_count), text);
+
+                let stitched: Vec<u8> = (0..region_count)
+                    .flat_map(|index| merge.span_slice(version, index..index + 1))
+                    .copied()
+                    .collect();
+                assert_eq!(stitched, text, "{texts:?}");
+
+                for start in 0..=region_count {
+                    for end in start..=region_count {
+                        let expected_lines =
+                            merge.boundary(version, start)..merge.boundary(version, end);
+                        let expected_bytes = merge.bytes(version, expected_lines.clone());
+                        assert_eq!(merge.span_lines(version, start..end), expected_lines);
+                        assert_eq!(merge.span_bytes(version, start..end), expected_bytes);
+                        assert_eq!(merge.span_slice(version, start..end), &text[expected_bytes]);
+                    }
+                }
+
+                assert_eq!(
+                    merge.line_span_bytes(version, text.len()..text.len()),
+                    text.len()..text.len()
+                );
+                if !text.is_empty() {
+                    let a = random.below(text.len());
+                    let b = random.below(text.len());
+                    let (lo, hi) = (a.min(b), a.max(b) + 1);
+                    let enclosed = merge.line_span_bytes(version, lo..hi);
+                    let expected_start = text[..lo]
+                        .iter()
+                        .rposition(|&byte| byte == b'\n')
+                        .map_or(0, |newline| newline + 1);
+                    let expected_end = text[hi - 1..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(text.len(), |newline| hi + newline);
+                    assert_eq!(enclosed, expected_start..expected_end, "{texts:?}");
+                }
+            }
         }
     }
 

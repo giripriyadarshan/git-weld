@@ -170,7 +170,7 @@ fn hoist_signatures(
 
         for version in Version::ALL {
             let outline = analysis.outline(version);
-            let span = merge.bytes(version, chunk.lines(merge, version));
+            let span = merge.span_bytes(version, chunk.regions.clone());
             for name in outline.referenced_names(span.clone()) {
                 names.insert(name);
             }

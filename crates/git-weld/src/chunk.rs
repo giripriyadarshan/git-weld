@@ -40,7 +40,7 @@ pub struct ChunkItem {
 impl Chunk {
     /// The chunk's 0-based, half-open line range in `version`.
     pub fn lines(&self, merge: &LineMerge, version: Version) -> Range<usize> {
-        merge.boundary(version, self.regions.start)..merge.boundary(version, self.regions.end)
+        merge.span_lines(version, self.regions.clone())
     }
 
     pub fn items(&self, version: Version) -> &[ChunkItem] {
@@ -77,7 +77,7 @@ pub fn chunks(merge: &LineMerge, analysis: Option<&Analysis>) -> Vec<Chunk> {
             .collect();
     };
 
-    let chunker = Chunker::new(merge, analysis);
+    let chunker = Chunker { merge, analysis };
     let mut spans: Vec<Range<usize>> = conflicts.map(|index| index..index + 1).collect();
     loop {
         let mut changed = false;
@@ -126,45 +126,24 @@ enum Cover {
 struct Chunker<'a> {
     merge: &'a LineMerge<'a>,
     analysis: &'a Analysis,
-    // The line of every region boundary in each version; never decreasing.
-    boundaries: [Vec<usize>; 3],
 }
 
 impl<'a> Chunker<'a> {
-    fn new(merge: &'a LineMerge<'a>, analysis: &'a Analysis) -> Self {
-        let boundaries = Version::ALL.map(|version| {
-            (0..=merge.regions().len())
-                .map(|index| merge.boundary(version, index))
-                .collect()
-        });
-        Self {
-            merge,
-            analysis,
-            boundaries,
-        }
-    }
-
-    fn bytes(&self, version: Version, span: &Range<usize>) -> Range<usize> {
-        let boundaries = &self.boundaries[version as usize];
-        self.merge
-            .bytes(version, boundaries[span.start]..boundaries[span.end])
-    }
-
     // The smallest span around `span` whose lines in `version` cover `bytes`.
     fn widen(&self, version: Version, span: &Range<usize>, bytes: &Range<usize>) -> Range<usize> {
-        let boundaries = &self.boundaries[version as usize];
         let first = self.merge.line_at(version, bytes.start);
         let end = self
             .merge
             .line_at(version, bytes.end.saturating_sub(1).max(bytes.start))
             + 1;
-        let start = boundaries.partition_point(|&line| line <= first) - 1;
-        let stop = boundaries.partition_point(|&line| line < end);
+        let regions = self.merge.regions();
+        let start = regions.partition_point(|region| region.lines(version).end <= first);
+        let stop = regions.partition_point(|region| region.lines(version).start < end);
         span.start.min(start)..span.end.max(stop)
     }
 
     fn cover(&self, version: Version, span: &Range<usize>) -> Cover {
-        let bytes = self.bytes(version, span);
+        let bytes = self.merge.span_bytes(version, span.clone());
         let outline = self.analysis.outline(version);
         if bytes.is_empty() {
             return cover_point(outline, bytes.start);
@@ -183,8 +162,12 @@ impl<'a> Chunker<'a> {
             match hits {
                 [] => return Cover::Nothing,
                 [only]
-                    if outline.item(*only).container
-                        && self.within_lines(version, &outline.item(*only).bytes, &bytes) =>
+                    if outline.item(*only).container && {
+                        let lines = self
+                            .merge
+                            .line_span_bytes(version, outline.item(*only).bytes.clone());
+                        lines.start <= bytes.start && bytes.end <= lines.end
+                    } =>
                 {
                     container = *only;
                 }
@@ -197,16 +180,6 @@ impl<'a> Chunker<'a> {
         }
     }
 
-    // Whether `span` lies within the lines that `item` touches.
-    fn within_lines(&self, version: Version, item: &Range<usize>, span: &Range<usize>) -> bool {
-        let first = self.merge.line_at(version, item.start);
-        let last = self
-            .merge
-            .line_at(version, item.end.saturating_sub(1).max(item.start));
-        let lines = self.merge.bytes(version, first..last + 1);
-        lines.start <= span.start && span.end <= lines.end
-    }
-
     fn chunk(&self, span: Range<usize>) -> Chunk {
         let mut decidable = true;
         let mut covers_items = false;
@@ -217,7 +190,7 @@ impl<'a> Chunker<'a> {
                 Cover::Outside => decidable = false,
             }
             let outline = self.analysis.outline(version);
-            outermost_items(outline, &self.bytes(version, &span))
+            outermost_items(outline, &self.merge.span_bytes(version, span.clone()))
                 .into_iter()
                 .map(|index| {
                     let item = outline.item(index);
@@ -376,7 +349,7 @@ mod tests {
                         .collect()
                 }),
                 text: Version::ALL.map(|version| {
-                    String::from_utf8(merge.slice(version, chunk.lines(merge, version)).to_vec())
+                    String::from_utf8(merge.span_slice(version, chunk.regions.clone()).to_vec())
                         .unwrap()
                 }),
             }
@@ -746,19 +719,6 @@ class Greeter:
         items
     }
 
-    // `inner` lies within the lines that `outer` touches.
-    fn within_lines(text: &[u8], outer: &Range<usize>, inner: &Range<usize>) -> bool {
-        let start = text[..outer.start]
-            .iter()
-            .rposition(|&byte| byte == b'\n')
-            .map_or(0, |newline| newline + 1);
-        let end = text[outer.end.max(1) - 1..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map_or(text.len(), |newline| outer.end.max(1) + newline);
-        start <= inner.start && inner.end <= end
-    }
-
     #[test]
     fn chunks_never_cut_through_items_on_random_edits() {
         let mut random = Random(0x2545_f491_4f6c_dd1d);
@@ -796,16 +756,16 @@ class Greeter:
                 }
                 decided += 1;
                 for version in Version::ALL {
-                    let text = merge.text(version);
-                    let span = merge.bytes(version, chunk.lines(&merge, version));
+                    let span = merge.span_bytes(version, chunk.regions.clone());
                     let outline = analysis.outline(version);
                     let mut stack = vec![Outline::ROOT];
                     while let Some(container) = stack.pop() {
                         for &child in &outline.item(container).children {
                             let item = &outline.item(child).bytes;
+                            let lines = merge.line_span_bytes(version, item.clone());
                             let disjoint = item.end <= span.start || span.end <= item.start;
                             let inside = span.start <= item.start && item.end <= span.end;
-                            let around = within_lines(text, item, &span);
+                            let around = lines.start <= span.start && span.end <= lines.end;
                             assert!(
                                 disjoint || inside || around,
                                 "{version} chunk {:?} cuts {}:\n{}",

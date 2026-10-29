@@ -573,7 +573,7 @@ fn note_combined_items(analysis: &Analysis, merge: &LineMerge, chunks: &[Chunk])
             .into_iter()
             .any(|(version, location)| {
                 location.as_ref().is_some_and(|location| {
-                    let span = merge.bytes(version, chunk.lines(merge, version));
+                    let span = merge.span_bytes(version, chunk.regions.clone());
                     location.bytes.start < span.end && span.start < location.bytes.end
                 })
             })
