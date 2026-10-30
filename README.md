@@ -246,15 +246,14 @@ GLOSSARY.md                       Canonical domain terms
 CODING_STANDARDS.md               Coding standards and review invariants
 CONTRIBUTING.md                   Checks, how to add a provider, and release workflow
 docs/adr/                         Architecture decision records
-crates/git-weld/src/main.rs       CLI, merge data flow, diagnostics, exit codes
-crates/git-weld/src/merge.rs      Line merge, conflict markers, and atomic output
-crates/git-weld/src/ast.rs        Language selection, parsing, item outlines, item comparison
-crates/git-weld/src/ast/items.rs  Item extraction, signatures, reference queries, fingerprints
-crates/git-weld/src/chunk.rs      Widening conflicts to chunks of whole items
-crates/git-weld/src/state.rs      Semantic state: chunks and hoisted signatures
-crates/git-weld/src/cache.rs      The .git/git-weld/cache SQLite decision cache
-crates/git-weld/src/provider.rs   Decision types and schema, SystemOneProvider, loading
-crates/git-weld/src/provider/     Jev (TypeSafe API), Ollama, and mock providers
-crates/git-weld/src/log.rs        The .git-weld.log decision log
-crates/git-weld/tests/            CLI, Jev, Ollama, cache, and real Git integration tests
+crates/git-weld/src/main.rs            CLI, merge data flow, diagnostics, exit codes
+crates/git-weld/src/merge.rs           Line merge, conflict markers, and atomic output
+crates/git-weld/src/semantic.rs        SemanticMerge: AST outlines, chunk widening, syntax check
+crates/git-weld/src/semantic/items.rs  Item extraction, signatures, reference queries, fingerprints
+crates/git-weld/src/semantic/state.rs  Semantic state: chunks and hoisted signatures
+crates/git-weld/src/cache.rs           The .git/git-weld/cache SQLite decision cache
+crates/git-weld/src/provider.rs        Decision types and schema, SystemOneProvider, loading
+crates/git-weld/src/provider/          Jev (TypeSafe API), Ollama, and mock providers
+crates/git-weld/src/log.rs             The .git-weld.log decision log
+crates/git-weld/tests/                 CLI, Jev, Ollama, cache, and real Git integration tests
 ```

@@ -2,11 +2,8 @@
 //! of every chunk that both sides changed, as plain text ([`fmt::Display`]) or
 //! as JSON ([`Serialize`]).
 
-use crate::{
-    ast::{Analysis, Language, Outline, OutlineItem, Segment, dedent},
-    chunk::{Chunk, ChunkItem},
-    merge::{LineMerge, Version},
-};
+use super::{Analysis, Chunk, Language, Outline, OutlineItem, Segment, dedent};
+use crate::merge::{LineMerge, Version};
 use serde::Serialize;
 use similar::TextDiff;
 use std::{
@@ -81,13 +78,18 @@ pub struct VersionState {
 impl SemanticState {
     /// Describes `chunks` of the merge of the file at `path`, including the
     /// signatures of any items in the same file that `chunks` reference.
-    pub fn new(path: &Path, analysis: &Analysis, merge: &LineMerge, chunks: &[&Chunk]) -> Self {
+    pub(super) fn new(
+        path: &Path,
+        analysis: &Analysis,
+        merge: &LineMerge,
+        chunks: &[&Chunk],
+    ) -> Self {
         Self {
             file: path.display().to_string(),
             language: analysis.language,
             chunks: chunks
                 .iter()
-                .map(|chunk| ChunkState::new(merge, chunk))
+                .map(|chunk| ChunkState::new(analysis, merge, chunk))
                 .collect(),
             signatures: hoist_signatures(analysis, merge, chunks),
         }
@@ -164,7 +166,6 @@ fn hoist_signatures(
 
     let mut referencing: HashMap<&[Segment], Vec<usize>> = HashMap::new();
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let chunk_paths = chunk.item_paths();
         let mut covered: HashSet<&[Segment]> = HashSet::new();
         let mut names: HashSet<&str> = HashSet::new();
 
@@ -174,20 +175,7 @@ fn hoist_signatures(
             for name in outline.referenced_names(span.clone()) {
                 names.insert(name);
             }
-            for item in outline.items().iter().skip(1) {
-                let inside_span = !span.is_empty()
-                    && !item.bytes.is_empty()
-                    && span.start <= item.bytes.start
-                    && item.bytes.end <= span.end;
-                let encloses_span = item.container
-                    && !span.is_empty()
-                    && !item.bytes.is_empty()
-                    && item.bytes.start <= span.start
-                    && span.end <= item.bytes.end;
-                if inside_span || encloses_span || chunk_paths.contains(&item.path) {
-                    covered.insert(item.key.as_slice());
-                }
-            }
+            outline.collect_covered_keys(&span, chunk.covered(version), &chunk.items, &mut covered);
         }
         if names.is_empty() {
             continue;
@@ -266,14 +254,29 @@ fn hoist_signatures(
 }
 
 impl ChunkState {
-    fn new(merge: &LineMerge, chunk: &Chunk) -> Self {
+    fn new(analysis: &Analysis, merge: &LineMerge, chunk: &Chunk) -> Self {
         let base = VersionState::new(merge, chunk, Version::Base, None);
         let ours = VersionState::new(merge, chunk, Version::Ours, base.as_ref());
         let theirs = VersionState::new(merge, chunk, Version::Theirs, base.as_ref());
         let present = [base.is_some(), ours.is_some(), theirs.is_some()];
+        let version_items: [Vec<&OutlineItem>; 3] = Version::ALL.map(|version| {
+            let outline = analysis.outline(version);
+            chunk
+                .covered(version)
+                .iter()
+                .map(|&index| outline.item(index))
+                .collect()
+        });
         Self {
-            summary: summary(Version::ALL.map(|version| chunk.items(version)), present),
-            items: chunk.item_paths(),
+            items: chunk.items.clone(),
+            summary: summary(
+                [
+                    version_items[0].as_slice(),
+                    version_items[1].as_slice(),
+                    version_items[2].as_slice(),
+                ],
+                present,
+            ),
             base,
             ours,
             theirs,
@@ -312,8 +315,8 @@ impl VersionState {
 
 // Modeled on the blueprint's example: "Node type `struct_item` 'User' in
 // Base had field 'x'. Branch A modified ... Branch B removed ...".
-fn summary(items: [&[ChunkItem]; 3], present: [bool; 3]) -> String {
-    fn paths(items: &[ChunkItem]) -> Vec<&str> {
+fn summary(items: [&[&OutlineItem]; 3], present: [bool; 3]) -> String {
+    fn paths<'a>(items: &[&'a OutlineItem]) -> Vec<&'a str> {
         items.iter().map(|item| item.path.as_str()).collect()
     }
     let mut versions = (0..3)
@@ -366,8 +369,8 @@ fn summary(items: [&[ChunkItem]; 3], present: [bool; 3]) -> String {
     format!("{noun} {subject} {base}. Ours {ours} {it}. Theirs {theirs}.")
 }
 
-fn listing(items: &[ChunkItem], describe: impl Fn(&ChunkItem) -> String) -> String {
-    let described: Vec<String> = items.iter().map(describe).collect();
+fn listing(items: &[&OutlineItem], describe: impl Fn(&OutlineItem) -> String) -> String {
+    let described: Vec<String> = items.iter().copied().map(describe).collect();
     match described.as_slice() {
         [] => String::new(),
         [only] => only.clone(),
@@ -462,7 +465,7 @@ fn write_indented(formatter: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ast, chunk, merge::Versions};
+    use crate::{merge::Versions, semantic::SemanticMerge};
     use serde_json::json;
 
     const BASE: &str = "\
@@ -485,16 +488,11 @@ impl Counter {
             theirs: theirs.as_bytes().to_vec(),
         };
         let merge = LineMerge::new(&versions).unwrap();
-        let analysis = ast::analyze(
-            Path::new(path),
-            &versions.base,
-            &versions.ours,
-            &versions.theirs,
-        )
-        .unwrap();
-        let chunks = chunk::chunks(&merge, Some(&analysis));
-        let decidable: Vec<&Chunk> = chunks.iter().filter(|chunk| chunk.decidable).collect();
-        SemanticState::new(Path::new(path), &analysis, &merge, &decidable)
+        SemanticMerge::analyze(Path::new(path), &merge)
+            .semantic_state()
+            .unwrap()
+            .unwrap()
+            .1
     }
 
     #[test]
@@ -974,5 +972,38 @@ def withdraw(account: Account, amount: int) -> int:
                 },
             ]
         );
+    }
+
+    #[test]
+    fn semantic_state_returns_decidable_chunk_indices_and_none_when_undecidable() {
+        let base = "fn alpha() -> u32 {\n    1\n}\n\n// base tail\n";
+        let ours = "fn alpha() -> u32 {\n    10\n}\n\n// ours tail\n";
+        let theirs = "fn alpha() -> u32 {\n    100\n}\n\n// theirs tail\n";
+        let versions = Versions {
+            base: base.as_bytes().to_vec(),
+            ours: ours.as_bytes().to_vec(),
+            theirs: theirs.as_bytes().to_vec(),
+        };
+        let merge = LineMerge::new(&versions).unwrap();
+        let semantic = SemanticMerge::analyze(Path::new("src/lib.rs"), &merge);
+
+        assert_eq!(semantic.chunks().len(), 2);
+        assert!(semantic.chunks()[0].decidable);
+        assert!(!semantic.chunks()[1].decidable);
+        let (indices, state) = semantic.semantic_state().unwrap().unwrap();
+        assert_eq!(indices, [0]);
+        assert_eq!(state.chunks.len(), 1);
+        assert_eq!(state.chunks[0].items, ["fn alpha"]);
+
+        let tail_only = Versions {
+            base: base.as_bytes().to_vec(),
+            ours: base.replace("// base tail", "// ours tail").into_bytes(),
+            theirs: base.replace("// base tail", "// theirs tail").into_bytes(),
+        };
+        let tail_merge = LineMerge::new(&tail_only).unwrap();
+        let tail_semantic = SemanticMerge::analyze(Path::new("src/lib.rs"), &tail_merge);
+        assert_eq!(tail_semantic.chunks().len(), 1);
+        assert!(!tail_semantic.chunks()[0].decidable);
+        assert_eq!(tail_semantic.semantic_state(), Ok(None));
     }
 }

@@ -1,14 +1,12 @@
 use clap::{Parser, builder::NonEmptyStringValueParser};
 use git_weld::{
-    ast::{self, Analysis, Divergence},
     cache::{self, Cache},
-    chunk::{self, Chunk},
     log::{self, Lines, Record},
     merge::{
-        Conflicts, LineMerge, Rendered, Span, Version, Versions, write_manual_conflict,
-        write_output,
+        Conflicts, LineMerge, Rendered, Version, Versions, write_manual_conflict, write_output,
     },
     provider::{self, AUTO_RESOLVE_THRESHOLD, Decision, MergeAction, SystemOneProvider},
+    semantic::{Chunk, DivergedItem, Divergence, MAX_CLEAN_ANALYZE_BYTES, SemanticMerge},
     state::SemanticState,
 };
 use std::{
@@ -113,8 +111,6 @@ fn main() -> ExitCode {
     }
 }
 
-const MAX_CLEAN_ANALYZE_BYTES: usize = 512 * 1024;
-
 // Exits 0 when no conflict markers are left, 1 when some are, and 2 when the
 // merge could not be written (`%A` is then left untouched).
 fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
@@ -134,27 +130,19 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
     if merge.is_clean() {
         let rendered = merge.render(&[], Conflicts::Markers(cli.marker_size));
         write_output(&cli.ours, &rendered.text)?;
-        if should_analyze_clean(&versions)
-            && let Ok(analysis) = analyze(&cli.path, &versions)
-        {
-            note_combined_items(&analysis, &merge, &[]);
+        if should_analyze_clean(&versions) {
+            let semantic = SemanticMerge::analyze(&cli.path, &merge);
+            note_combined_items(semantic.combined_items());
         }
         return Ok(ExitCode::SUCCESS);
     }
 
-    let analysis = analyze(&cli.path, &versions);
-    let chunks = find_chunks(&merge, analysis.as_ref().ok());
-    report_chunks(cli, &merge, &chunks, analysis.as_ref().err());
-    let analysis = analysis.ok();
+    let semantic = SemanticMerge::analyze(&cli.path, &merge);
+    report_chunks(cli, &merge, &semantic);
 
-    let decisions = match &analysis {
-        Some(analysis) => decide(cli, analysis, &merge, &chunks),
-        None => None,
-    };
-    let mut takes: Vec<Option<Version>> = chunks
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
+    let decisions = decide(cli, &semantic);
+    let mut takes: Vec<Option<Version>> = (0..semantic.chunks().len())
+        .map(|index| {
             decisions
                 .as_ref()
                 .and_then(|decisions| decisions.decided(index))
@@ -165,26 +153,25 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
                 })
         })
         .collect();
-    if let Some(analysis) = &analysis
-        && takes.iter().any(Option::is_some)
-        && let Err(error) = check_stitched(analysis, &merge, &chunks, &takes)
-    {
+    let (rendered, syntax) = semantic.resolve(&mut takes, cli.marker_size);
+    if let Err(error) = syntax {
         eprintln!(
             "git-weld: the stitched result does not parse ({error}), \
              so every chunk keeps its conflict markers"
         );
-        takes.fill(None);
     }
 
-    let rendered = merge.render(&spans(&chunks, &takes), Conflicts::Markers(cli.marker_size));
     write_output(&cli.ours, &rendered.text)?;
-    report_outcome(&chunks, &takes, &rendered, analysis.is_some());
+    report_outcome(
+        semantic.chunks(),
+        &takes,
+        &rendered,
+        semantic.language().is_some(),
+    );
     if let Some(decisions) = &decisions {
-        write_log(cli, &chunks, decisions, &takes, &rendered);
+        write_log(cli, semantic.chunks(), decisions, &takes, &rendered);
     }
-    if let Some(analysis) = &analysis {
-        note_combined_items(analysis, &merge, &chunks);
-    }
+    note_combined_items(semantic.combined_items());
     Ok(if rendered.markers == 0 {
         ExitCode::SUCCESS
     } else {
@@ -222,21 +209,6 @@ fn should_analyze_clean(versions: &Versions) -> bool {
         && versions.ours != versions.theirs
 }
 
-// Without an analysis, conflicts keep the text merge's markers; nothing else
-// changes.
-fn analyze(path: &Path, versions: &Versions) -> Result<Analysis, String> {
-    panic::catch_unwind(|| ast::analyze(path, &versions.base, &versions.ours, &versions.theirs))
-        .map_err(|_| "it failed unexpectedly".to_owned())?
-        .map_err(|error| error.to_string())
-}
-
-fn find_chunks(merge: &LineMerge, analysis: Option<&Analysis>) -> Vec<Chunk> {
-    panic::catch_unwind(AssertUnwindSafe(|| chunk::chunks(merge, analysis))).unwrap_or_else(|_| {
-        eprintln!("git-weld: chunking failed unexpectedly; no model will be consulted");
-        chunk::chunks(merge, None)
-    })
-}
-
 fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("1 {noun}")
@@ -245,14 +217,15 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
-fn report_chunks(cli: &Cli, merge: &LineMerge, chunks: &[Chunk], skipped: Option<&String>) {
+fn report_chunks(cli: &Cli, merge: &LineMerge, semantic: &SemanticMerge) {
     let conflicts = plural(merge.conflicts(), "conflict");
     let path = cli.path.display();
-    if let Some(reason) = skipped {
+    if let Some(reason) = semantic.analysis_error() {
         eprintln!("git-weld: {path}: {conflicts} (provider: {})", cli.provider);
         eprintln!("git-weld: semantic analysis skipped: {reason}");
         return;
     }
+    let chunks = semantic.chunks();
     eprintln!(
         "git-weld: {path}: {conflicts} in {} (provider: {}):",
         plural(chunks.len(), "chunk"),
@@ -298,26 +271,19 @@ impl Decisions {
 // Asks the provider about every decidable chunk not already in the cache, in
 // one evaluation. Problems only cost the missed decisions; every undecided
 // chunk then keeps its markers.
-fn decide(
-    cli: &Cli,
-    analysis: &Analysis,
-    merge: &LineMerge,
-    chunks: &[Chunk],
-) -> Option<Decisions> {
-    let asked: Vec<usize> = (0..chunks.len())
-        .filter(|&index| chunks[index].decidable)
-        .collect();
-    if asked.is_empty() {
+fn decide(cli: &Cli, semantic: &SemanticMerge) -> Option<Decisions> {
+    if !semantic.chunks().iter().any(|chunk| chunk.decidable) {
         return None;
     }
     let provider = load_provider(&cli.provider)?;
     let name = provider.name().to_owned();
-    let Ok(state) = panic::catch_unwind(AssertUnwindSafe(|| {
-        let selected: Vec<&Chunk> = asked.iter().map(|&index| &chunks[index]).collect();
-        SemanticState::new(&cli.path, analysis, merge, &selected)
-    })) else {
-        eprintln!("git-weld: {name} evaluation failed unexpectedly");
-        return None;
+    let (asked, state) = match semantic.semantic_state() {
+        Ok(Some(state)) => state,
+        Ok(None) => return None,
+        Err(_) => {
+            eprintln!("git-weld: {name} evaluation failed unexpectedly");
+            return None;
+        }
     };
 
     let cache_store = (!cli.no_cache)
@@ -439,31 +405,6 @@ fn load_provider(name: &str) -> Option<Box<dyn SystemOneProvider>> {
     }
 }
 
-fn spans(chunks: &[Chunk], takes: &[Option<Version>]) -> Vec<Span> {
-    chunks
-        .iter()
-        .zip(takes)
-        .map(|(chunk, &take)| Span {
-            regions: chunk.regions.clone(),
-            take,
-        })
-        .collect()
-}
-
-// The resolved chunks must fit the code around them. Chunks left for manual
-// resolution are filled with our side for the check, since markers never parse.
-fn check_stitched(
-    analysis: &Analysis,
-    merge: &LineMerge,
-    chunks: &[Chunk],
-    takes: &[Option<Version>],
-) -> Result<(), String> {
-    let probe = merge.render(&spans(chunks, takes), Conflicts::Fill(Version::Ours));
-    panic::catch_unwind(|| ast::check_syntax(analysis.language, &probe.text))
-        .map_err(|_| "the parser failed unexpectedly".to_owned())?
-        .map_err(|error| error.to_string())
-}
-
 // Such as "line 4", "lines 1-9", or "lines 1-9, 11 and 13-18".
 fn line_list(ranges: &[&RangeInclusive<usize>]) -> String {
     let parts: Vec<String> = ranges
@@ -543,7 +484,7 @@ fn write_log(
                 time: time.clone(),
                 file: cli.path.display().to_string(),
                 chunk: index + 1,
-                items: chunks[index].item_paths(),
+                items: chunks[index].items.clone(),
                 lines: rendered.lines[index].clone().map(Lines::from),
                 provider: decisions.provider.clone(),
                 decision: entry.decision.decision,
@@ -562,33 +503,17 @@ fn write_log(
 // Items that both sides changed but the line merge combined (Q9 of the
 // blueprint tracker) are never sent to a model. A note points them out,
 // since combined edits can still clash in meaning.
-fn note_combined_items(analysis: &Analysis, merge: &LineMerge, chunks: &[Chunk]) {
-    for diverged in &analysis.diverged_items {
-        let in_chunk = chunks.iter().any(|chunk| {
-            [
-                (Version::Base, &diverged.base),
-                (Version::Ours, &diverged.ours),
-                (Version::Theirs, &diverged.theirs),
-            ]
-            .into_iter()
-            .any(|(version, location)| {
-                location.as_ref().is_some_and(|location| {
-                    let span = merge.span_bytes(version, chunk.regions.clone());
-                    location.bytes.start < span.end && span.start < location.bytes.end
-                })
-            })
-        });
-        if !in_chunk {
-            let change = match diverged.kind {
-                Divergence::BothAdded => "added",
-                _ => "changed",
-            };
-            eprintln!(
-                "git-weld: note: both sides {change} {}, but the edits do not overlap, \
-                 so they were merged line by line",
-                diverged.item
-            );
-        }
+fn note_combined_items(combined_items: &[DivergedItem]) {
+    for diverged in combined_items {
+        let change = match diverged.kind {
+            Divergence::BothAdded => "added",
+            _ => "changed",
+        };
+        eprintln!(
+            "git-weld: note: both sides {change} {}, but the edits do not overlap, \
+             so they were merged line by line",
+            diverged.item
+        );
     }
 }
 

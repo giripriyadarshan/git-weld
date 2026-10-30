@@ -5,11 +5,11 @@ These standards govern code changes, reviews, and documentation in `git-weld`. R
 ## 1. Fail-Safe Manual Fallback Invariant
 
 - **Never corrupt or guess on a merge.** Every failure mode must degrade safely to standard diff3 conflict markers for **manual resolution** (exit code `1`), preserving non-overlapping line edits from `LineMerge`:
-  - Unsupported file extensions, non-UTF-8 inputs, or syntax errors in **base**, **ours**, or **theirs** (`crates/git-weld/src/ast.rs`).
-  - **Conflicts** outside every syntactic **item** (`crates/git-weld/src/chunk.rs`).
+  - Unsupported file extensions, non-UTF-8 inputs, or syntax errors in **base**, **ours**, or **theirs** (`crates/git-weld/src/semantic.rs`).
+  - **Conflicts** outside every syntactic **item** (`crates/git-weld/src/semantic.rs`).
   - Unknown or unconfigured **providers**, network/HTTP errors, timeouts, request size limits (`> 128 KiB`), or schema-invalid responses (`crates/git-weld/src/provider.rs`).
   - **Decisions** with action `Manual` or confidence `<= 0.95` (`AUTO_RESOLVE_THRESHOLD` is strictly `> 0.95`).
-  - Stitched output that fails `ast::check_syntax` (including Python `block` nodes with no non-comment statements), which rolls back all **chunks** in the file to **manual resolution** (`crates/git-weld/src/main.rs`).
+  - Stitched output that fails syntax verification in `SemanticMerge::resolve` (including Python `block` nodes with no non-comment statements), which rolls back all **chunks** in the file to **manual resolution** (`crates/git-weld/src/semantic.rs`).
 - **Protect `%A` on driver errors.** Unreadable inputs, uncreatable output files, or invalid CLI flags must exit with code `2` without modifying `%A`. Write merged output atomically via `NamedTempFile` in the target directory while preserving file permissions (`crates/git-weld/src/merge.rs`).
 - **Advisory side effects never alter merge outcomes.** Failures in the SQLite **decision cache** (`crates/git-weld/src/cache.rs`) or the `.git-weld.log` **decision log** (`crates/git-weld/src/log.rs`) must never change the merged text or exit code.
 - **No unsafe code.** The workspace forbids `unsafe` (`unsafe_code = "forbid"` in `Cargo.toml`).
@@ -19,12 +19,12 @@ These standards govern code changes, reviews, and documentation in `git-weld`. R
 Use the exact terms defined in [`GLOSSARY.md`](GLOSSARY.md) in types, identifiers, diagnostics, comments, and documentation:
 
 - **`Version` vs `Side`**:
-  - **Version** (`merge::Version`) is one of the three inputs to a three-way merge: `Base`, `Ours`, or `Theirs`. Never name another struct `Version` (for example, use `state::VersionState` for a chunk's per-version code slice), and never use `side` as an identifier when indexing or iterating over all three **versions**.
+  - **Version** (`merge::Version`) is one of the three inputs to a three-way merge: `Base`, `Ours`, or `Theirs`. Never name another struct `Version` (for example, use `semantic::VersionState` for a chunk's per-version code slice), and never use `side` as an identifier when indexing or iterating over all three **versions**.
   - **Side** refers only to one of the two diverging versions being merged (`ours` or `theirs`), excluding `base`. Never use `branch` to mean a **side**.
 - **`Conflict` vs `Chunk` vs `DivergedItem`** (never "hunk" for AST units):
   - **Conflict** is a region of overlapping, non-identical line edits from `LineMerge`.
-  - **Chunk** (`chunk::Chunk`) is a contiguous span of merge regions widened to cover whole syntactic **items** in all three **versions**, evaluated and replaced as a unit.
-  - **Diverged item** (`ast::DivergedItem`) is an **item** that both **sides** changed differently relative to **base**, whether or not the line edits overlap.
+  - **Chunk** (`semantic::Chunk`) is a contiguous span of merge regions widened to cover whole syntactic **items** in all three **versions**, evaluated and replaced as a unit.
+  - **Diverged item** (`semantic::DivergedItem`) is an **item** that both **sides** changed differently relative to **base**, whether or not the line edits overlap.
 - **`Item` vs Container**:
   - **Item** is a named syntactic declaration in one **version**, including its leading comments, attributes, and decorators.
   - Containers (`impl`, `trait`, `mod`, and `extern` blocks in Rust; `class` definitions in Python) have member **items** that are compared and chunked individually unless a **conflict** touches the container's own header or delimiters.

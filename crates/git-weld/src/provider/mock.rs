@@ -64,9 +64,8 @@ impl SystemOneProvider for MockProvider {
 mod tests {
     use super::*;
     use crate::{
-        ast::Language,
         provider::{Confidence, MergeAction},
-        state::ChunkState,
+        semantic::{ChunkState, Language},
     };
 
     fn state(chunks: usize) -> SemanticState {

@@ -63,16 +63,16 @@ const PYTHON_REFERENCES_QUERY: &str = r#"
 // `occurrence` separates repeated names in the same body, such as a Python
 // property getter and its setter.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct Segment {
+pub(super) struct Segment {
     label: String,
     name: String,
     occurrence: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Reference {
-    pub(crate) bytes: Range<usize>,
-    pub(crate) name: String,
+pub(super) struct Reference {
+    pub(super) bytes: Range<usize>,
+    pub(super) name: String,
 }
 
 // Containers (impl, trait, mod and extern blocks, and classes) leave their
@@ -1020,7 +1020,7 @@ fn slice_signature(source: &str, bytes: Range<usize>) -> String {
     dedent(raw.trim_end())
 }
 
-pub(crate) fn dedent(text: &str) -> String {
+pub(super) fn dedent(text: &str) -> String {
     let indentation = |line: &str| {
         let content = line.trim_start_matches([' ', '\t']);
         line.len() - content.len()

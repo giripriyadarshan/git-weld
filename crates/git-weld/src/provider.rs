@@ -393,7 +393,7 @@ fn error_chain(error: &dyn Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ast::Language, state::ChunkState};
+    use crate::semantic::{ChunkState, Language};
     use std::collections::HashMap;
 
     fn confidence(value: f64) -> Confidence {

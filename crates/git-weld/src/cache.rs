@@ -212,10 +212,7 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ast::Language,
-        state::{ChunkState, SignatureState, VersionState},
-    };
+    use crate::semantic::{ChunkState, Language, SignatureState, VersionState};
     use tempfile::tempdir;
 
     fn sample_state(

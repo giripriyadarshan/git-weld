@@ -579,8 +579,8 @@ fn decision(response: &Response, id: &str) -> Result<Decision, ProviderError> {
 mod tests {
     use super::*;
     use crate::{
-        ast, chunk,
         merge::{LineMerge, Versions},
+        semantic::SemanticMerge,
     };
     use serde_json::{Value, json};
     use std::{collections::HashMap, path::Path};
@@ -599,13 +599,12 @@ mod tests {
                 .replace("2\n", "22\n")
                 .into_bytes(),
         };
-        let path = Path::new("src/lib.rs");
         let merge = LineMerge::new(&versions).unwrap();
-        let analysis =
-            ast::analyze(path, &versions.base, &versions.ours, &versions.theirs).unwrap();
-        let chunks = chunk::chunks(&merge, Some(&analysis));
-        let chunks: Vec<_> = chunks.iter().collect();
-        SemanticState::new(path, &analysis, &merge, &chunks)
+        SemanticMerge::analyze(Path::new("src/lib.rs"), &merge)
+            .semantic_state()
+            .unwrap()
+            .unwrap()
+            .1
     }
 
     fn provider() -> JevProvider {
