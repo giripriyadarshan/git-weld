@@ -20,10 +20,11 @@ They never reach the network.
 git-weld talks to models through the `SystemOneProvider` trait in
 `crates/git-weld/src/provider.rs`. A provider receives the semantic state of
 one file, holding every chunk the driver wants decided, and returns one
-`Decision` per chunk. Everything around that is the driver's job: the line
-merge, chunking, the `0.95` confidence gate, stitching, conflict markers, the
-parse check, and the decision log. A provider only turns chunks into
-decisions.
+`Decision` per chunk. Everything around that is the driver's job
+(`git_weld::run_driver` in `crates/git-weld/src/lib.rs` and `SemanticMerge` in
+`crates/git-weld/src/semantic.rs`): the line merge, chunking, the `0.95`
+confidence gate, stitching, conflict markers, the parse check, and the decision
+log. A provider only turns chunks into decisions.
 
 The steps below use Cloudflare's Clef as the example, one of the planned
 providers.
@@ -75,9 +76,10 @@ The trait uses `#[async_trait]` because the driver holds providers as
   overall timeout of your own.
 - **Ask about all chunks at once.** A file with three conflicts should cost
   one round trip. Send all chunks in one request when the backend supports
-  batches, as Jev does with one question per chunk. Otherwise ask about them
-  concurrently rather than one after another, since they share one time
-  limit.
+  batches, as Jev and Ollama do through `SystemOneClient` in
+  `crates/git-weld/src/provider/http.rs` with one question per chunk. Otherwise
+  ask about them concurrently rather than one after another, since they share
+  one time limit.
 - **Keep the meaning of the decisions.** `TakeOurs` means "ours' version of
   the chunk exactly as it is, which already includes theirs' change or an
   equivalent one, so nothing from theirs is lost", and `TakeTheirs` mirrors
@@ -132,19 +134,20 @@ and the expected provider lists in `tests/merge_driver.rs`.
 
 Tests must not reach the network or need real credentials.
 
-- **Unit tests** in the provider's module: build a `SemanticState` (the
-  `state` helpers in the tests of `provider.rs` and `provider/http.rs` show two
-  ways), then check the request you would send and the decisions you decode,
-  including answers that must be rejected.
+- **Unit tests** in the provider's module: build a `SemanticState` (using
+  `SemanticMerge::analyze` in `crates/git-weld/src/semantic.rs` or the `state`
+  helpers in the tests of `provider.rs` and `provider/http.rs`), then check the
+  request you would send and the decisions you decode, including answers that
+  must be rejected.
 - **HTTP behavior:** point the provider at the scripted server in
   `crates/git-weld/tests/support/mod.rs`, as `tests/jev_provider.rs` does:
   `Server::start(vec![Response::new(200, body)])` serves canned responses on
   localhost and records every request, so you can check the request shape,
   authentication, error handling, retries, and timeouts.
-- **End to end:** `tests/merge_driver.rs` runs the real binary, including
-  through `git merge`. The `mock` provider, which answers from
-  `WELD_MOCK_DECISION`, shows how the driver acts on decisions without any
-  backend.
+- **End to end:** `tests/merge_driver.rs` exercises `git_weld::run_driver`
+  in-process and runs the real binary, including through `git merge`. The
+  `mock` provider, which answers from `WELD_MOCK_DECISION`, shows how the
+  driver acts on decisions without any backend.
 
 ### 4. Document it
 

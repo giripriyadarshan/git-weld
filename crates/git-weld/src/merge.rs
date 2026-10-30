@@ -520,7 +520,7 @@ impl Writer {
 }
 
 /// Replaces `output` with `contents` atomically, keeping its permissions.
-pub fn write_output(output: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_output(output: &Path, contents: &[u8]) -> Result<()> {
     let permissions = fs::metadata(output)
         .with_context(|| format!("failed to inspect output file {}", output.display()))?
         .permissions();
@@ -549,7 +549,11 @@ pub fn write_output(output: &Path, contents: &[u8]) -> Result<()> {
 
 /// Writes one conflict over the whole file, all three versions in diff3
 /// order. This is the fallback when the line merge cannot be trusted.
-pub fn write_manual_conflict(output: &Path, versions: &Versions, marker_size: u16) -> Result<()> {
+pub(crate) fn write_manual_conflict(
+    output: &Path,
+    versions: &Versions,
+    marker_size: u16,
+) -> Result<()> {
     ensure!(
         marker_size > 0,
         "conflict marker size must be greater than zero"

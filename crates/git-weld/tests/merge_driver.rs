@@ -1,7 +1,9 @@
 mod support;
 
+use git_weld::{DriverError, DriverOptions, MergeOutcome, provider, run_driver};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -120,6 +122,36 @@ impl MergeFixture {
             .env("TYPESAFE_BASE_URL", url)
             .env("TYPESAFE_DEFAULT_MODEL", "jev-1.13.0");
         command
+    }
+
+    fn run_in_process(
+        &self,
+        logical_path: &str,
+        provider_name: &str,
+        no_cache: bool,
+        env_pairs: &[(&str, &str)],
+    ) -> (Result<MergeOutcome, DriverError>, String) {
+        let base = self.path("base");
+        let ours = self.path("ours");
+        let theirs = self.path("theirs");
+        let options = DriverOptions {
+            base: &base,
+            ours: &ours,
+            theirs: &theirs,
+            path: Path::new(logical_path),
+            provider: provider_name,
+            timeout: Duration::from_secs(10),
+            no_cache,
+            marker_size: 7,
+        };
+        let values: HashMap<String, String> = env_pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        let env = |key: &str| values.get(key).cloned();
+        let mut diagnostics = Vec::new();
+        let outcome = run_driver(&options, &env, self.directory.path(), &mut diagnostics);
+        (outcome, String::from_utf8(diagnostics).unwrap())
     }
 
     fn result(&self) -> String {
@@ -1841,11 +1873,79 @@ fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
         contributing.contains("cargo audit --deny warnings"),
         "CONTRIBUTING.md must require cargo audit --deny warnings"
     );
+    for expected in [
+        "run_driver",
+        "SemanticMerge",
+        "SystemOneClient",
+        "evaluate_with_cache",
+    ] {
+        assert!(
+            contributing.contains(expected),
+            "CONTRIBUTING.md must reference {expected}"
+        );
+    }
 
     let coding_standards = fs::read_to_string(workspace_root.join("CODING_STANDARDS.md")).unwrap();
     assert!(
         coding_standards.contains("cargo audit --deny warnings"),
         "CODING_STANDARDS.md must require cargo audit --deny warnings"
+    );
+    for expected in [
+        "run_driver",
+        "SemanticMerge",
+        "SystemOneClient",
+        "evaluate_with_cache",
+    ] {
+        assert!(
+            coding_standards.contains(expected),
+            "CODING_STANDARDS.md must reference {expected}"
+        );
+    }
+
+    let readme = fs::read_to_string(workspace_root.join("README.md")).unwrap();
+    for expected in [
+        "run_driver",
+        "SemanticMerge",
+        "SystemOneClient",
+        "evaluate_with_cache",
+    ] {
+        assert!(
+            readme.contains(expected),
+            "README.md must reference {expected}"
+        );
+    }
+
+    let src_dir = manifest_dir.join("src");
+    let main_rs = fs::read_to_string(src_dir.join("main.rs")).unwrap();
+    assert!(
+        main_rs.contains("run_driver(") && main_rs.contains("DriverOptions"),
+        "main.rs must delegate merge execution to git_weld::run_driver"
+    );
+    assert!(
+        main_rs.lines().count() < 150,
+        "main.rs must stay a thin CLI adapter under 150 lines (got {})",
+        main_rs.lines().count()
+    );
+
+    let lib_rs = fs::read_to_string(src_dir.join("lib.rs")).unwrap();
+    assert!(
+        lib_rs.contains("pub fn run_driver(") && lib_rs.contains("mod log;"),
+        "lib.rs must expose run_driver and keep log internal"
+    );
+    assert!(
+        !src_dir.join("ast.rs").exists() && !src_dir.join("chunk.rs").exists(),
+        "ast and chunk modules must stay collapsed into semantic.rs"
+    );
+
+    let ollama_rs = fs::read_to_string(src_dir.join("provider/ollama.rs")).unwrap();
+    assert!(
+        !ollama_rs.contains("super::jev"),
+        "ollama.rs must not import sideways from super::jev"
+    );
+    let jev_rs = fs::read_to_string(src_dir.join("provider/jev.rs")).unwrap();
+    assert!(
+        !jev_rs.contains("pub(super)"),
+        "jev.rs must not expose pub(super) protocol helpers"
     );
 
     let mut prose_files = vec![
@@ -1872,4 +1972,174 @@ fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
             path.display()
         );
     }
+}
+
+#[test]
+fn run_driver_in_process_handles_clean_merge_and_combined_item_notes() {
+    let base =
+        "fn alpha() -> u32 {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    a + b + c\n}\n";
+    let ours = base.replace("= 1", "= 10");
+    let theirs = base.replace("= 3", "= 30");
+    let fixture = MergeFixture::with_contents(base, &ours, &theirs);
+
+    let (outcome, diagnostics) = fixture.run_in_process("src/lib.rs", provider::MANUAL, false, &[]);
+
+    assert_eq!(outcome.unwrap(), MergeOutcome::Resolved);
+    assert_eq!(
+        diagnostics,
+        "git-weld: note: both sides changed fn alpha, but the edits do not overlap, \
+         so they were merged line by line\n"
+    );
+    assert_eq!(
+        fixture.result(),
+        base.replace("= 1", "= 10").replace("= 3", "= 30")
+    );
+    assert!(fixture.log().is_empty());
+}
+
+#[test]
+fn run_driver_in_process_falls_back_to_manual_resolution_on_low_confidence_or_manual_decision() {
+    let fixture = MergeFixture::rust_conflict(true);
+    let mock_decisions = format!(
+        "[{}, {}]",
+        decision("TakeOurs", 0.95, "boundary confidence"),
+        decision("Manual", 0.8, "both changes matter")
+    );
+
+    let (outcome, diagnostics) = fixture.run_in_process(
+        "src/lib.rs",
+        "mock",
+        false,
+        &[("WELD_MOCK_DECISION", &mock_decisions)],
+    );
+
+    assert_eq!(outcome.unwrap(), MergeOutcome::ManualResolution);
+    assert!(
+        diagnostics.ends_with(
+            "git-weld: mock decided 2 chunks:\n\
+             git-weld:   chunk 1: TakeOurs, confidence 0.95, not above the 0.95 threshold: \
+             boundary confidence\n\
+             git-weld:   chunk 2: Manual, confidence 0.8: both changes matter\n\
+             git-weld: 2 chunks left for manual resolution, at lines 1-9 and 11-19\n"
+        ),
+        "{diagnostics}"
+    );
+    assert_eq!(fixture.result(), rust_conflict_result(true));
+    let resolved: Vec<_> = fixture
+        .log()
+        .iter()
+        .map(|record| record["resolved"].clone())
+        .collect();
+    assert_eq!(resolved, [json!(false), json!(false)]);
+}
+
+#[test]
+fn run_driver_in_process_returns_driver_error_and_preserves_ours_when_input_is_unreadable() {
+    let fixture = MergeFixture::new();
+    fs::remove_file(fixture.path("base")).unwrap();
+
+    let (outcome, diagnostics) = fixture.run_in_process("src/lib.rs", provider::MANUAL, false, &[]);
+
+    let error = outcome.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("failed to read base file"),
+        "{error:#}"
+    );
+    assert_eq!(diagnostics, "");
+    assert_eq!(fs::read(fixture.path("ours")).unwrap(), b"ours\n");
+}
+
+#[test]
+fn run_driver_in_process_auto_resolves_logs_and_hits_decision_cache_on_second_run() {
+    let server = Server::start(vec![Response::new(200, jev_answers(&[("TakeOurs", 0.99)]))]);
+    let fixture = MergeFixture::rust_conflict(false);
+    git_success(
+        fixture.directory.path(),
+        &["init", "--quiet", "--initial-branch=main", "--template="],
+    );
+    let url = server.url();
+    let env = [
+        ("TYPESAFE_API_KEY", "ts-test-key"),
+        ("TYPESAFE_BASE_URL", url.as_str()),
+        ("TYPESAFE_DEFAULT_MODEL", "jev-1.13.0"),
+    ];
+    let (expected_ours, _) = rust_versions(false);
+
+    // First run evaluates via Jev, resolves `%A`, logs `cached: false`, and populates SQLite.
+    let (first_outcome, first_diagnostics) =
+        fixture.run_in_process("src/lib.rs", "jev", false, &env);
+    assert_eq!(first_outcome.unwrap(), MergeOutcome::Resolved);
+    assert!(
+        first_diagnostics.contains("git-weld:   chunk 1: TakeOurs, confidence 0.99"),
+        "{first_diagnostics}"
+    );
+    assert_eq!(fixture.result(), expected_ours);
+    assert_eq!(server.requests().len(), 1);
+    assert!(
+        fixture
+            .directory
+            .path()
+            .join(".git/git-weld/cache")
+            .is_file()
+    );
+
+    // Second run against the same `work_dir` hits the SQLite decision cache without a network call.
+    let (ours_input, _) = rust_versions(false);
+    fs::write(fixture.path("ours"), ours_input).unwrap();
+    let (second_outcome, second_diagnostics) =
+        fixture.run_in_process("src/lib.rs", "jev", false, &env);
+    assert_eq!(second_outcome.unwrap(), MergeOutcome::Resolved);
+    assert!(
+        second_diagnostics.contains("git-weld:   chunk 1: TakeOurs (cached), confidence 0.99"),
+        "{second_diagnostics}"
+    );
+    assert_eq!(fixture.result(), expected_ours);
+    assert_eq!(server.requests().len(), 1);
+
+    let log = fixture.log();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0]["resolved"], json!(true));
+    assert_eq!(log[0]["cached"], json!(false));
+    assert_eq!(log[1]["resolved"], json!(true));
+    assert_eq!(log[1]["cached"], json!(true));
+}
+
+#[test]
+fn run_driver_in_process_rolls_back_all_chunks_when_stitched_syntax_fails() {
+    let base =
+        "class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        return 2\n";
+    let ours = "class A:\n    def f(self):\n        return 10\n\n";
+    let theirs = "class A:\n\n    def g(self):\n        return 20\n";
+    let fixture = MergeFixture::with_contents(base, ours, theirs);
+    let mock_decisions = format!(
+        "[{}, {}]",
+        decision("TakeTheirs", 0.99, "theirs deleted f"),
+        decision("TakeOurs", 0.99, "ours deleted g")
+    );
+
+    let (outcome, diagnostics) = fixture.run_in_process(
+        "app.py",
+        "mock",
+        false,
+        &[("WELD_MOCK_DECISION", &mock_decisions)],
+    );
+
+    assert_eq!(outcome.unwrap(), MergeOutcome::ManualResolution);
+    assert!(
+        diagnostics.contains(
+            "git-weld: the stitched result does not parse (it has a syntax error at line "
+        ),
+        "{diagnostics}"
+    );
+    assert!(
+        diagnostics.ends_with(
+            "so every chunk keeps its conflict markers\n\
+             git-weld: 2 chunks left for manual resolution, at lines 2-9 and 11-18\n"
+        ),
+        "{diagnostics}"
+    );
+    let log = fixture.log();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0]["resolved"], json!(false));
+    assert_eq!(log[1]["resolved"], json!(false));
 }

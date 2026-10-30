@@ -22,7 +22,7 @@ use std::{
 };
 use tree_sitter::{Node, Parser, Point, Tree};
 
-pub const MAX_CLEAN_ANALYZE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_CLEAN_ANALYZE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Language {

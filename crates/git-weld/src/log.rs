@@ -15,35 +15,35 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const FILE_NAME: &str = ".git-weld.log";
+pub(crate) const FILE_NAME: &str = ".git-weld.log";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Record {
+pub(crate) struct Record {
     /// When the merge ran, in UTC (RFC 3339), such as `2026-10-12T14:42:27Z`.
-    pub time: String,
+    pub(crate) time: String,
     /// The logical path of the merged file (`%P`).
-    pub file: String,
+    pub(crate) file: String,
     /// The chunk's number in the file, from 1.
-    pub chunk: usize,
+    pub(crate) chunk: usize,
     /// The paths of the chunk's items, such as `impl Counter > fn get`.
-    pub items: Vec<String>,
+    pub(crate) items: Vec<String>,
     /// Where the chunk is in the merged file, 1-based and inclusive: the
     /// chosen side's code when resolved, the conflict markers otherwise.
-    pub lines: Option<Lines>,
-    pub provider: String,
-    pub decision: MergeAction,
-    pub confidence: f64,
-    pub reason: String,
+    pub(crate) lines: Option<Lines>,
+    pub(crate) provider: String,
+    pub(crate) decision: MergeAction,
+    pub(crate) confidence: f64,
+    pub(crate) reason: String,
     /// Whether git-weld replaced the chunk with the chosen side's code.
-    pub resolved: bool,
+    pub(crate) resolved: bool,
     /// Whether the decision came from the local decision cache.
-    pub cached: bool,
+    pub(crate) cached: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct Lines {
-    pub start: usize,
-    pub end: usize,
+pub(crate) struct Lines {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl From<RangeInclusive<usize>> for Lines {
@@ -57,7 +57,7 @@ impl From<RangeInclusive<usize>> for Lines {
 
 /// Appends `records` to the log at `path` in a single write, so records of
 /// drivers that run at the same time do not interleave.
-pub fn append(path: &Path, records: &[Record]) -> io::Result<()> {
+pub(crate) fn append(path: &Path, records: &[Record]) -> io::Result<()> {
     if records.is_empty() {
         return Ok(());
     }
@@ -82,7 +82,7 @@ pub fn append(path: &Path, records: &[Record]) -> io::Result<()> {
 }
 
 /// The current time in UTC, formatted as RFC 3339.
-pub fn now() -> String {
+pub(crate) fn now() -> String {
     timestamp(SystemTime::now())
 }
 

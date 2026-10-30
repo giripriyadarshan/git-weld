@@ -8,9 +8,9 @@ These standards govern code changes, reviews, and documentation in `git-weld`. R
   - Unsupported file extensions, non-UTF-8 inputs, or syntax errors in **base**, **ours**, or **theirs** (`crates/git-weld/src/semantic.rs`).
   - **Conflicts** outside every syntactic **item** (`crates/git-weld/src/semantic.rs`).
   - Unknown or unconfigured **providers**, network/HTTP errors, timeouts, request size limits (`> 128 KiB`), or schema-invalid responses (`crates/git-weld/src/provider.rs`).
-  - **Decisions** with action `Manual` or confidence `<= 0.95` (`AUTO_RESOLVE_THRESHOLD` is strictly `> 0.95`).
+  - **Decisions** with action `Manual` or confidence `<= 0.95` (`AUTO_RESOLVE_THRESHOLD` is strictly `> 0.95` in `crates/git-weld/src/provider.rs` and `crates/git-weld/src/lib.rs`).
   - Stitched output that fails syntax verification in `SemanticMerge::resolve` (including Python `block` nodes with no non-comment statements), which rolls back all **chunks** in the file to **manual resolution** (`crates/git-weld/src/semantic.rs`).
-- **Protect `%A` on driver errors.** Unreadable inputs, uncreatable output files, or invalid CLI flags must exit with code `2` without modifying `%A`. Write merged output atomically via `NamedTempFile` in the target directory while preserving file permissions (`crates/git-weld/src/merge.rs`).
+- **Protect `%A` on driver errors.** Unreadable inputs, uncreatable output files, or invalid CLI flags must exit with code `2` without modifying `%A` (`git_weld::run_driver` in `crates/git-weld/src/lib.rs` and `crates/git-weld/src/main.rs`). Write merged output atomically via `NamedTempFile` in the target directory while preserving file permissions (`crates/git-weld/src/merge.rs`).
 - **Advisory side effects never alter merge outcomes.** Failures in the SQLite **decision cache** (`crates/git-weld/src/cache.rs`) or the `.git-weld.log` **decision log** (`crates/git-weld/src/log.rs`) must never change the merged text or exit code.
 - **No unsafe code.** The workspace forbids `unsafe` (`unsafe_code = "forbid"` in `Cargo.toml`).
 
@@ -36,16 +36,16 @@ Use the exact terms defined in [`GLOSSARY.md`](GLOSSARY.md) in types, identifier
 
 ## 3. Credential, Endpoint, and Cache Security
 
-- **Environment injection (`provider::Env`) and empty-variable resilience.** Providers must read environment variables only through the `Env` closure passed to `from_env(env: Env)`, never by calling `std::env::var` directly inside provider modules (`crates/git-weld/src/provider.rs`). Empty or whitespace-only optional environment variables (including `WELD_NO_CACHE=""`) must be treated as unset rather than failing CLI parsing.
+- **Environment injection (`provider::Env`) and empty-variable resilience.** Providers must read environment variables only through the `Env` closure passed to `from_env(env: Env)` (and threaded from `git_weld::run_driver` in `crates/git-weld/src/lib.rs`), never by calling `std::env::var` directly inside provider modules (`crates/git-weld/src/provider.rs`). Empty or whitespace-only optional environment variables (including `WELD_NO_CACHE=""`) must be treated as unset rather than failing CLI parsing.
 - **Never leak credentials.** Mark authorization headers with `HeaderValue::set_sensitive(true)` and implement `fmt::Debug` manually on every provider holding an API key so keys never appear in debug output, logs, or error messages.
-- **HTTPS required for remote endpoints.** Reject plain `http://` URLs unless the host is loopback (`localhost`, `127.0.0.0/8`, or `::1`), and reject URLs containing embedded userinfo credentials, query strings, or fragments (`crates/git-weld/src/provider/http.rs`, `crates/git-weld/src/provider/jev.rs`, `crates/git-weld/src/provider/ollama.rs`).
+- **HTTPS required for remote endpoints.** Reject plain `http://` URLs unless the host is loopback (`localhost`, `127.0.0.0/8`, or `::1`), and reject URLs containing embedded userinfo credentials, query strings, or fragments (`SystemOneClient` in `crates/git-weld/src/provider/http.rs`, `crates/git-weld/src/provider/jev.rs`, `crates/git-weld/src/provider/ollama.rs`).
 - **Cache hygiene ([ADR-0002](docs/adr/0002-sqlite-decision-cache.md)).** Store only SHA-256 keys and **decisions** (never source code) in `<git-common-dir>/git-weld/cache`. Never cache answers produced when **hoisted signatures** had to be trimmed to fit the 128 KiB request limit (`Evaluation.trimmed` in `provider::evaluate_with_cache`).
 
 ## 4. Offline, Deterministic Testing
 
 - **No network access or external credentials in tests.** Test HTTP providers against the local scripted server in `crates/git-weld/tests/support/mod.rs` and CLI workflows with `MockProvider` (`WELD_MOCK_DECISION`) or the scripted server.
 - **Scrub ambient environment variables.** CLI and Git integration tests in `crates/git-weld/tests/merge_driver.rs` must clear `WELD_*`, `TYPESAFE_*`, and `OLLAMA_*` variables and isolate Git configuration (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL` pointing to a nonexistent path) in disposable `tempfile::TempDir` repositories.
-- **Test at the highest seam first.** Prefer end-to-end CLI and real `git merge` / `git rebase` / `git worktree` integration tests, supplemented by focused unit and property tests for pure invariants (`LineMerge` consistency, chunk item-boundary invariants, signature hoisting, and cache key/TTL rules).
+- **Test at the highest seam first.** Prefer in-process `git_weld::run_driver` (`crates/git-weld/src/lib.rs`), `SemanticMerge` (`crates/git-weld/src/semantic.rs`), and `provider::evaluate_with_cache` (`crates/git-weld/src/provider.rs`) tests alongside end-to-end CLI and real `git merge` / `git rebase` / `git worktree` integration tests, supplemented by focused unit and property tests for pure invariants (`LineMerge` consistency, chunk item-boundary invariants, signature hoisting, and cache key/TTL rules).
 
 ## 5. Prose and Documentation Style
 
