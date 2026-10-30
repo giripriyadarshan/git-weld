@@ -5,7 +5,9 @@ use git_weld::{
     merge::{
         Conflicts, LineMerge, Rendered, Version, Versions, write_manual_conflict, write_output,
     },
-    provider::{self, AUTO_RESOLVE_THRESHOLD, Decision, MergeAction, SystemOneProvider},
+    provider::{
+        self, AUTO_RESOLVE_THRESHOLD, Decision, Evaluation, MergeAction, SystemOneProvider,
+    },
     semantic::{Chunk, DivergedItem, Divergence, MAX_CLEAN_ANALYZE_BYTES, SemanticMerge},
     state::SemanticState,
 };
@@ -318,9 +320,10 @@ fn decide(cli: &Cli, semantic: &SemanticMerge) -> Option<Decisions> {
         };
         let fresh = evaluate_misses(&name, provider.as_ref(), &missed_state, cli.timeout);
         if let Some(fresh) = fresh {
-            let trimmed = provider.would_trim(&missed_state);
-            for (&position, decision) in misses.iter().zip(fresh) {
-                if !trimmed && let (Some((cache, _)), Some(key)) = (&cache_store, &keys[position]) {
+            for (&position, decision) in misses.iter().zip(fresh.decisions) {
+                if !fresh.trimmed
+                    && let (Some((cache, _)), Some(key)) = (&cache_store, &keys[position])
+                {
                     cache.put(key, &decision);
                 }
                 decided[position] = Some((decision, false));
@@ -366,7 +369,7 @@ fn evaluate_misses(
     provider: &dyn SystemOneProvider,
     state: &SemanticState,
     timeout: Duration,
-) -> Option<Vec<Decision>> {
+) -> Option<Evaluation> {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -382,7 +385,7 @@ fn evaluate_misses(
     }));
     runtime.shutdown_background();
     match evaluation {
-        Ok(Ok(decisions)) => Some(decisions),
+        Ok(Ok(evaluation)) => Some(evaluation),
         Ok(Err(error)) => {
             eprintln!("git-weld: {name} evaluation failed: {error}");
             None

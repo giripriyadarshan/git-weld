@@ -2,23 +2,16 @@
 //! through its `POST /v1/systemone` endpoint.
 
 use super::{
-    Decision, Env, ProviderError, SystemOneProvider,
-    jev::{
-        PROMPT_REVISION, Retry, bearer_header, config, decisions, encode_request, http_client,
-        send_request, systemone_endpoint, trim_model, would_trim_request,
-    },
+    Env, Evaluation, ProviderError, SystemOneProvider,
+    http::{SystemOneClient, bearer_header, config, systemone_endpoint, trim_model},
 };
 use crate::state::SemanticState;
 use async_trait::async_trait;
-use reqwest::{Client, Url, header::HeaderValue};
+use reqwest::Url;
 use std::{fmt, time::Duration};
 
 pub struct OllamaProvider {
-    client: Client,
-    endpoint: Url,
-    authorization: Option<HeaderValue>,
-    model: String,
-    retry: Retry,
+    http: SystemOneClient,
 }
 
 impl OllamaProvider {
@@ -37,15 +30,9 @@ impl OllamaProvider {
             .map(|key| bearer_header(Self::API_KEY_ENV, key))
             .transpose()?;
         let endpoint = ollama_endpoint(host)?;
-        let client = http_client(&endpoint)?;
+        let http = SystemOneClient::new(endpoint, model, authorization, Self::API_KEY_ENV)?;
 
-        Ok(Self {
-            client,
-            endpoint,
-            authorization,
-            model,
-            retry: Retry::default(),
-        })
+        Ok(Self { http })
     }
 
     /// Reads `OLLAMA_MODEL` (required), `OLLAMA_HOST` (default
@@ -61,27 +48,22 @@ impl OllamaProvider {
     }
 
     pub fn with_retries(mut self, max_retries: u32, initial_backoff: Duration) -> Self {
-        self.retry.max_retries = max_retries;
-        self.retry.initial_backoff = initial_backoff;
+        self.http = self.http.with_retries(max_retries, initial_backoff);
         self
     }
 
     pub fn endpoint(&self) -> &str {
-        self.endpoint.as_str()
+        self.http.endpoint()
     }
 
     pub fn model(&self) -> &str {
-        &self.model
+        self.http.model()
     }
 }
 
 impl fmt::Debug for OllamaProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OllamaProvider")
-            .field("endpoint", &self.endpoint.as_str())
-            .field("model", &self.model)
-            .finish_non_exhaustive()
+        self.http.fmt_debug("OllamaProvider", formatter)
     }
 }
 
@@ -92,25 +74,11 @@ impl SystemOneProvider for OllamaProvider {
     }
 
     fn cache_key(&self) -> Option<String> {
-        Some(format!("{}:{}:{PROMPT_REVISION}", Self::NAME, self.model))
+        Some(self.http.cache_key(Self::NAME))
     }
 
-    fn would_trim(&self, state: &SemanticState) -> bool {
-        would_trim_request(&self.model, state)
-    }
-
-    async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
-        let (body, _) = encode_request(&self.model, state)?;
-        let response = send_request(
-            &self.client,
-            &self.endpoint,
-            self.authorization.as_ref(),
-            Self::API_KEY_ENV,
-            self.retry,
-            body,
-        )
-        .await?;
-        decisions(&response, state.chunks.len())
+    async fn evaluate(&self, state: &SemanticState) -> Result<Evaluation, ProviderError> {
+        self.http.evaluate(state).await
     }
 }
 
@@ -170,6 +138,13 @@ mod tests {
         .unwrap();
         assert_eq!(bare_port.endpoint(), "http://127.0.0.1:11435/v1/systemone");
 
+        let v1_suffix = OllamaProvider::from_env(&env(&[
+            ("OLLAMA_MODEL", "kev:0.8b-bf16"),
+            ("OLLAMA_HOST", "http://127.0.0.1:11434/v1"),
+        ]))
+        .unwrap();
+        assert_eq!(v1_suffix.endpoint(), "http://127.0.0.1:11434/v1/systemone");
+
         let remote = OllamaProvider::from_env(&env(&[
             ("OLLAMA_MODEL", "kev:0.8b-bf16"),
             ("OLLAMA_HOST", "https://ollama.example.com/api"),
@@ -182,6 +157,7 @@ mod tests {
         );
         let debug = format!("{remote:?}");
         assert!(debug.contains("kev:0.8b-bf16"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
         assert!(!debug.contains("ollama-secret"), "{debug}");
 
         assert_eq!(

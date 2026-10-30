@@ -2,6 +2,7 @@
 //! provider returns, the [`SystemOneProvider`] trait, and loading a provider
 //! by the name given to `--provider`.
 
+mod http;
 mod jev;
 mod mock;
 mod ollama;
@@ -274,6 +275,34 @@ impl fmt::Display for ProviderError {
 
 impl Error for ProviderError {}
 
+/// The decisions for every chunk of a [`SemanticState`], plus whether hoisted
+/// signatures had to be trimmed to fit the provider's request size limit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Evaluation {
+    pub decisions: Vec<Decision>,
+    pub trimmed: bool,
+}
+
+impl Evaluation {
+    pub const fn new(decisions: Vec<Decision>, trimmed: bool) -> Self {
+        Self { decisions, trimmed }
+    }
+
+    pub const fn untrimmed(decisions: Vec<Decision>) -> Self {
+        Self {
+            decisions,
+            trimmed: false,
+        }
+    }
+
+    pub const fn trimmed(decisions: Vec<Decision>) -> Self {
+        Self {
+            decisions,
+            trimmed: true,
+        }
+    }
+}
+
 /// A System One backend that decides how to resolve conflicting chunks.
 ///
 /// Implementations are used as `Box<dyn SystemOneProvider>`, so they are
@@ -289,16 +318,11 @@ pub trait SystemOneProvider: Send + Sync {
         None
     }
 
-    /// Whether `state` only fits within the provider's request size limit by
-    /// trimming hoisted signatures.
-    fn would_trim(&self, _state: &SemanticState) -> bool {
-        false
-    }
-
-    /// Returns one decision per entry of `state.chunks`, in the same order.
-    /// A backend that cannot batch questions may ask about the chunks
-    /// concurrently.
-    async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError>;
+    /// Returns one decision per entry of `state.chunks`, in the same order,
+    /// along with whether hoisted signatures had to be trimmed to fit the
+    /// provider's request size limit. A backend that cannot batch questions
+    /// may ask about the chunks concurrently.
+    async fn evaluate(&self, state: &SemanticState) -> Result<Evaluation, ProviderError>;
 }
 
 /// Asks `provider` about every chunk in `state`, giving up after `timeout`,
@@ -307,21 +331,21 @@ pub async fn evaluate(
     provider: &dyn SystemOneProvider,
     state: &SemanticState,
     timeout: Duration,
-) -> Result<Vec<Decision>, ProviderError> {
+) -> Result<Evaluation, ProviderError> {
     if state.chunks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Evaluation::untrimmed(Vec::new()));
     }
-    let decisions = tokio::time::timeout(timeout, provider.evaluate(state))
+    let evaluation = tokio::time::timeout(timeout, provider.evaluate(state))
         .await
         .map_err(|_| ProviderError::Timeout(timeout))??;
-    if decisions.len() != state.chunks.len() {
+    if evaluation.decisions.len() != state.chunks.len() {
         return Err(ProviderError::InvalidResponse(format!(
             "decision count {} does not match chunk count {}",
-            decisions.len(),
+            evaluation.decisions.len(),
             state.chunks.len()
         )));
     }
-    Ok(decisions)
+    Ok(evaluation)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -564,8 +588,8 @@ mod tests {
             "fixed"
         }
 
-        async fn evaluate(&self, _: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
-            Ok(self.0.clone())
+        async fn evaluate(&self, _: &SemanticState) -> Result<Evaluation, ProviderError> {
+            Ok(Evaluation::untrimmed(self.0.clone()))
         }
     }
 
@@ -577,9 +601,9 @@ mod tests {
             "slow"
         }
 
-        async fn evaluate(&self, _: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
+        async fn evaluate(&self, _: &SemanticState) -> Result<Evaluation, ProviderError> {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok(Vec::new())
+            Ok(Evaluation::untrimmed(Vec::new()))
         }
     }
 
@@ -588,12 +612,15 @@ mod tests {
         let decision = Decision::new(MergeAction::TakeTheirs, confidence(0.99), "theirs");
         let provider: Box<dyn SystemOneProvider> = Box::new(Fixed(vec![decision.clone(); 2]));
 
-        let decisions = evaluate(provider.as_ref(), &state(2), Duration::from_secs(5))
+        let evaluation = evaluate(provider.as_ref(), &state(2), Duration::from_secs(5))
             .await
             .unwrap();
 
         assert_eq!(provider.name(), "fixed");
-        assert_eq!(decisions, [decision.clone(), decision]);
+        assert_eq!(
+            evaluation,
+            Evaluation::untrimmed(vec![decision.clone(), decision])
+        );
     }
 
     #[tokio::test]
@@ -610,7 +637,7 @@ mod tests {
         );
         assert_eq!(
             evaluate(&Slow, &state(0), Duration::from_millis(1)).await,
-            Ok(Vec::new())
+            Ok(Evaluation::untrimmed(Vec::new()))
         );
     }
 

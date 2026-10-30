@@ -33,7 +33,7 @@ providers.
 Create `crates/git-weld/src/provider/clef.rs`:
 
 ```rust
-use super::{Decision, Env, ProviderError, SystemOneProvider};
+use super::{Env, Evaluation, ProviderError, SystemOneProvider};
 use crate::state::SemanticState;
 use async_trait::async_trait;
 
@@ -58,7 +58,7 @@ impl SystemOneProvider for ClefProvider {
         Self::NAME
     }
 
-    async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
+    async fn evaluate(&self, state: &SemanticState) -> Result<Evaluation, ProviderError> {
         todo!("ask about all {} chunks and return one decision each", state.chunks.len())
     }
 }
@@ -67,10 +67,12 @@ impl SystemOneProvider for ClefProvider {
 The trait uses `#[async_trait]` because the driver holds providers as
 `Box<dyn SystemOneProvider>`. Keep these rules in mind:
 
-- **One decision per chunk, in order.** `evaluate` returns exactly one
-  decision for each entry of `state.chunks`. `provider::evaluate` wraps your
-  method: it rejects any other count and applies the `--timeout` limit to the
-  whole evaluation, so do not add an overall timeout of your own.
+- **One decision per chunk, in order.** `evaluate` returns an `Evaluation`
+  whose `decisions` holds one decision for each entry of `state.chunks` and
+  whose `trimmed` flag reports whether hoisted signatures had to be trimmed.
+  `provider::evaluate` wraps your method: it rejects any other count and
+  applies the `--timeout` limit to the whole evaluation, so do not add an
+  overall timeout of your own.
 - **Ask about all chunks at once.** A file with three conflicts should cost
   one round trip. Send all chunks in one request when the backend supports
   batches, as Jev does with one question per chunk. Otherwise ask about them
@@ -80,7 +82,7 @@ The trait uses `#[async_trait]` because the driver holds providers as
   the chunk exactly as it is, which already includes theirs' change or an
   equivalent one, so nothing from theirs is lost", and `TakeTheirs` mirrors
   it. When neither side alone is right, the answer is `Manual`. The question
-  and criteria in `provider/jev.rs` spell this out and make a good starting
+  and criteria in `provider/http.rs` spell this out and make a good starting
   point for a prompt.
 - **Never guess.** A decision has a `decision` (`TakeOurs`, `TakeTheirs`, or
   `Manual`), a `confidence` from 0 to 1, and a `reason`. Backends that
@@ -96,10 +98,10 @@ The trait uses `#[async_trait]` because the driver holds providers as
   file that the chunks reference.
 - **Opt in to the decision cache.** Implement `cache_key(&self) -> Option<String>`
   to return a string combining your provider's name, its configured model, and
-  a prompt revision, and implement `would_trim(&self, state: &SemanticState) -> bool`
-  if your provider trims `state.signatures` to fit a request size limit (so
-  trimmed-context answers are never cached). Leave the default `None` for
-  test-only providers that should not write to `.git/git-weld/cache`.
+  a prompt revision, and return `Evaluation::trimmed(decisions)` (setting
+  `trimmed: true`) when `evaluate` trims `state.signatures` to fit a request
+  size limit so trimmed-context answers are never cached. Leave the default
+  `None` for test-only providers that should not write to `.git/git-weld/cache`.
 - **Protect credentials.** Read settings only through `env`, never through
   `std::env`, so tests can pass their own. Do not log or print keys; if the
   struct holds one, implement `Debug` by hand as `JevProvider` does. Require
@@ -130,7 +132,7 @@ and the expected provider lists in `tests/merge_driver.rs`.
 Tests must not reach the network or need real credentials.
 
 - **Unit tests** in the provider's module: build a `SemanticState` (the
-  `state` helpers in the tests of `provider.rs` and `provider/jev.rs` show two
+  `state` helpers in the tests of `provider.rs` and `provider/http.rs` show two
   ways), then check the request you would send and the decisions you decode,
   including answers that must be rejected.
 - **HTTP behavior:** point the provider at the scripted server in

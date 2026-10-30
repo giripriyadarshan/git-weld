@@ -38,8 +38,8 @@ Use the exact terms defined in [`GLOSSARY.md`](GLOSSARY.md) in types, identifier
 
 - **Environment injection (`provider::Env`) and empty-variable resilience.** Providers must read environment variables only through the `Env` closure passed to `from_env(env: Env)`, never by calling `std::env::var` directly inside provider modules (`crates/git-weld/src/provider.rs`). Empty or whitespace-only optional environment variables (including `WELD_NO_CACHE=""`) must be treated as unset rather than failing CLI parsing.
 - **Never leak credentials.** Mark authorization headers with `HeaderValue::set_sensitive(true)` and implement `fmt::Debug` manually on every provider holding an API key so keys never appear in debug output, logs, or error messages.
-- **HTTPS required for remote endpoints.** Reject plain `http://` URLs unless the host is loopback (`localhost`, `127.0.0.0/8`, or `::1`), and reject URLs containing embedded userinfo credentials, query strings, or fragments (`crates/git-weld/src/provider/jev.rs`, `crates/git-weld/src/provider/ollama.rs`).
-- **Cache hygiene ([ADR-0002](docs/adr/0002-sqlite-decision-cache.md)).** Store only SHA-256 keys and **decisions** (never source code) in `<git-common-dir>/git-weld/cache`. Never cache answers produced when **hoisted signatures** had to be trimmed to fit the 128 KiB request limit.
+- **HTTPS required for remote endpoints.** Reject plain `http://` URLs unless the host is loopback (`localhost`, `127.0.0.0/8`, or `::1`), and reject URLs containing embedded userinfo credentials, query strings, or fragments (`crates/git-weld/src/provider/http.rs`, `crates/git-weld/src/provider/jev.rs`, `crates/git-weld/src/provider/ollama.rs`).
+- **Cache hygiene ([ADR-0002](docs/adr/0002-sqlite-decision-cache.md)).** Store only SHA-256 keys and **decisions** (never source code) in `<git-common-dir>/git-weld/cache`. Never cache answers produced when **hoisted signatures** had to be trimmed to fit the 128 KiB request limit (`Evaluation.trimmed`).
 
 ## 4. Offline, Deterministic Testing
 

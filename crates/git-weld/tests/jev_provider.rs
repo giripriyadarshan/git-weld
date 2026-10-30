@@ -2,9 +2,12 @@ mod support;
 
 use git_weld::{
     merge::{LineMerge, Versions},
-    provider::{self, Confidence, Decision, JevProvider, MergeAction, ProviderError},
+    provider::{
+        self, Confidence, Decision, Evaluation, JevProvider, MergeAction, OllamaProvider,
+        ProviderError,
+    },
     semantic::SemanticMerge,
-    state::SemanticState,
+    state::{SemanticState, SignatureState},
 };
 use serde_json::json;
 use std::{
@@ -51,7 +54,9 @@ fn answer(choice: &str, confidence: f64) -> String {
 }
 
 async fn evaluate(jev: &JevProvider) -> Result<Vec<Decision>, ProviderError> {
-    provider::evaluate(jev, &state(), Duration::from_secs(10)).await
+    let evaluation = provider::evaluate(jev, &state(), Duration::from_secs(10)).await?;
+    assert!(!evaluation.trimmed);
+    Ok(evaluation.decisions)
 }
 
 #[tokio::test]
@@ -210,4 +215,70 @@ async fn reports_refused_connections_after_retrying() {
         panic!("expected a transport error, got {error:?}");
     };
     assert!(message.contains("error sending request"), "{message}");
+}
+
+#[tokio::test]
+async fn trims_oversized_signatures_and_marks_evaluation_as_trimmed_for_jev_and_ollama() {
+    let server = Server::start(vec![
+        Response::new(200, answer("TakeOurs", 0.99)),
+        Response::new(200, answer("TakeTheirs", 0.98)),
+    ]);
+    let mut trimmed_state = state();
+    trimmed_state.signatures = vec![
+        SignatureState {
+            item: "fn helper".to_owned(),
+            signature: Some("fn helper() -> u32".to_owned()),
+            base: None,
+            ours: None,
+            theirs: None,
+            chunks: vec![0],
+        },
+        SignatureState {
+            item: "struct Huge".to_owned(),
+            signature: Some("x".repeat(128 * 1024)),
+            base: None,
+            ours: None,
+            theirs: None,
+            chunks: vec![0],
+        },
+    ];
+
+    let jev_evaluation =
+        provider::evaluate(&jev(&server.url()), &trimmed_state, Duration::from_secs(10))
+            .await
+            .unwrap();
+    let ollama = OllamaProvider::new(&server.url(), "kev:0.8b-bf16", None)
+        .unwrap()
+        .with_retries(2, Duration::from_millis(10));
+    let ollama_evaluation = provider::evaluate(&ollama, &trimmed_state, Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        jev_evaluation,
+        Evaluation::trimmed(vec![Decision::new(
+            MergeAction::TakeOurs,
+            Confidence::new(0.99).unwrap(),
+            "jev-1.13.0 chose TakeOurs \
+             (probabilities: Manual 0.01, TakeOurs 0.01, TakeTheirs 0.98)"
+        )])
+    );
+    assert_eq!(
+        ollama_evaluation,
+        Evaluation::trimmed(vec![Decision::new(
+            MergeAction::TakeTheirs,
+            Confidence::new(0.98).unwrap(),
+            "jev-1.13.0 chose TakeTheirs \
+             (probabilities: Manual 0.01, TakeOurs 0.01, TakeTheirs 0.98)"
+        )])
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            request.json()["state"]["signatures"],
+            json!([{"item": "fn helper", "signature": "fn helper() -> u32"}])
+        );
+    }
 }

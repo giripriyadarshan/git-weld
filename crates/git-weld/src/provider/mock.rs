@@ -1,7 +1,7 @@
 //! An offline provider for tests: it answers with decisions read from
 //! `WELD_MOCK_DECISION` instead of asking a model.
 
-use super::{Decision, Env, ProviderError, SystemOneProvider};
+use super::{Decision, Env, Evaluation, ProviderError, SystemOneProvider};
 use crate::state::SemanticState;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -37,26 +37,27 @@ impl SystemOneProvider for MockProvider {
         Self::NAME
     }
 
-    async fn evaluate(&self, state: &SemanticState) -> Result<Vec<Decision>, ProviderError> {
+    async fn evaluate(&self, state: &SemanticState) -> Result<Evaluation, ProviderError> {
         let invalid = |error: serde_json::Error| ProviderError::InvalidResponse(error.to_string());
         let count = state.chunks.len();
-        match serde_json::from_str(&self.answer).map_err(invalid)? {
+        let decisions = match serde_json::from_str(&self.answer).map_err(invalid)? {
             Value::Array(answers) if answers.len() != count => {
-                Err(ProviderError::InvalidResponse(format!(
+                return Err(ProviderError::InvalidResponse(format!(
                     "{}: decision count {} does not match chunk count {count}",
                     Self::ENV,
                     answers.len()
-                )))
+                )));
             }
             Value::Array(answers) => answers
                 .into_iter()
                 .map(|answer| serde_json::from_value(answer).map_err(invalid))
-                .collect(),
+                .collect::<Result<Vec<Decision>, ProviderError>>()?,
             answer => {
                 let decision: Decision = serde_json::from_value(answer).map_err(invalid)?;
-                Ok(vec![decision; count])
+                vec![decision; count]
             }
-        }
+        };
+        Ok(Evaluation::untrimmed(decisions))
     }
 }
 
@@ -95,10 +96,13 @@ mod tests {
             r#"{"decision": "TakeTheirs", "confidence": 0.99, "reason": "theirs wins"}"#,
         );
 
-        let decisions = mock.evaluate(&state(2)).await.unwrap();
+        let evaluation = mock.evaluate(&state(2)).await.unwrap();
 
         let expected = decision(MergeAction::TakeTheirs, 0.99, "theirs wins");
-        assert_eq!(decisions, [expected.clone(), expected]);
+        assert_eq!(
+            evaluation,
+            Evaluation::untrimmed(vec![expected.clone(), expected])
+        );
     }
 
     #[tokio::test]
@@ -112,10 +116,10 @@ mod tests {
 
         assert_eq!(
             mock.evaluate(&state(2)).await.unwrap(),
-            [
+            Evaluation::untrimmed(vec![
                 decision(MergeAction::TakeOurs, 1.0, "a"),
                 decision(MergeAction::Manual, 0.4, "b")
-            ]
+            ])
         );
         assert_eq!(
             mock.evaluate(&state(3)).await.unwrap_err().to_string(),
