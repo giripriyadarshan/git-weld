@@ -100,8 +100,9 @@ The trait uses `#[async_trait]` because the driver holds providers as
   to return a string combining your provider's name, its configured model, and
   a prompt revision, and return `Evaluation::trimmed(decisions)` (setting
   `trimmed: true`) when `evaluate` trims `state.signatures` to fit a request
-  size limit so trimmed-context answers are never cached. Leave the default
-  `None` for test-only providers that should not write to `.git/git-weld/cache`.
+  size limit so `provider::evaluate_with_cache` never caches trimmed-context
+  answers. Leave the default `None` for test-only providers that should not
+  write to `.git/git-weld/cache`.
 - **Protect credentials.** Read settings only through `env`, never through
   `std::env`, so tests can pass their own. Do not log or print keys; if the
   struct holds one, implement `Debug` by hand as `JevProvider` does. Require

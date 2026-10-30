@@ -1,19 +1,15 @@
 use clap::{Parser, builder::NonEmptyStringValueParser};
 use git_weld::{
-    cache::{self, Cache},
+    cache::Cache,
     log::{self, Lines, Record},
     merge::{
         Conflicts, LineMerge, Rendered, Version, Versions, write_manual_conflict, write_output,
     },
-    provider::{
-        self, AUTO_RESOLVE_THRESHOLD, Decision, Evaluation, MergeAction, SystemOneProvider,
-    },
+    provider::{self, AUTO_RESOLVE_THRESHOLD, Decision, MergeAction, SystemOneProvider},
     semantic::{Chunk, DivergedItem, Divergence, MAX_CLEAN_ANALYZE_BYTES, SemanticMerge},
-    state::SemanticState,
 };
 use std::{
     ops::RangeInclusive,
-    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
@@ -288,58 +284,24 @@ fn decide(cli: &Cli, semantic: &SemanticMerge) -> Option<Decisions> {
         }
     };
 
-    let cache_store = (!cli.no_cache)
-        .then(|| provider.cache_key())
-        .flatten()
-        .and_then(|key| Cache::open_in_repo(Path::new(".")).map(|cache| (cache, key)));
-    let keys: Vec<Option<[u8; 32]>> = (0..asked.len())
-        .map(|position| {
-            cache_store
-                .as_ref()
-                .map(|(_, provider_key)| cache::chunk_key(provider_key, &state, position))
-        })
-        .collect();
-
-    let mut decided: Vec<Option<(Decision, bool)>> = vec![None; asked.len()];
-    let mut misses: Vec<usize> = Vec::new();
-    for position in 0..asked.len() {
-        if let (Some((cache, _)), Some(key)) = (&cache_store, &keys[position])
-            && let Some(hit) = cache.get(key)
-        {
-            decided[position] = Some((hit, true));
-        } else {
-            misses.push(position);
-        }
-    }
-
-    if !misses.is_empty() {
-        let missed_state = if misses.len() == asked.len() {
-            state.clone()
-        } else {
-            state.select_chunks(&misses)
-        };
-        let fresh = evaluate_misses(&name, provider.as_ref(), &missed_state, cli.timeout);
-        if let Some(fresh) = fresh {
-            for (&position, decision) in misses.iter().zip(fresh.decisions) {
-                if !fresh.trimmed
-                    && let (Some((cache, _)), Some(key)) = (&cache_store, &keys[position])
-                {
-                    cache.put(key, &decision);
-                }
-                decided[position] = Some((decision, false));
-            }
-        }
+    let cache = (!cli.no_cache && provider.cache_key().is_some())
+        .then(|| Cache::open_in_repo(Path::new(".")))
+        .flatten();
+    let evaluation =
+        provider::evaluate_with_cache(provider.as_ref(), &state, cache.as_ref(), cli.timeout);
+    if let Some(error) = &evaluation.error {
+        eprintln!("git-weld: {error}");
     }
 
     let entries: Vec<DecidedChunk> = asked
         .into_iter()
-        .zip(decided)
-        .filter_map(|(chunk, entry)| {
-            let (decision, cached) = entry?;
+        .zip(evaluation.decisions)
+        .filter_map(|(chunk, resolved)| {
+            let resolved = resolved?;
             Some(DecidedChunk {
                 chunk,
-                decision,
-                cached,
+                decision: resolved.decision,
+                cached: resolved.cached,
             })
         })
         .collect();
@@ -362,39 +324,6 @@ fn decide(cli: &Cli, semantic: &SemanticMerge) -> Option<Decisions> {
         provider: name,
         entries,
     })
-}
-
-fn evaluate_misses(
-    name: &str,
-    provider: &dyn SystemOneProvider,
-    state: &SemanticState,
-    timeout: Duration,
-) -> Option<Evaluation> {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("git-weld: {name} evaluation skipped: cannot start a runtime: {error}");
-            return None;
-        }
-    };
-    let evaluation = panic::catch_unwind(AssertUnwindSafe(|| {
-        runtime.block_on(provider::evaluate(provider, state, timeout))
-    }));
-    runtime.shutdown_background();
-    match evaluation {
-        Ok(Ok(evaluation)) => Some(evaluation),
-        Ok(Err(error)) => {
-            eprintln!("git-weld: {name} evaluation failed: {error}");
-            None
-        }
-        Err(_) => {
-            eprintln!("git-weld: {name} evaluation failed unexpectedly");
-            None
-        }
-    }
 }
 
 // A provider that cannot be loaded only costs the decisions.

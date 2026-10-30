@@ -97,7 +97,10 @@ impl SemanticState {
 
     /// The hoisted signatures referenced by `chunk` (an index into
     /// [`Self::chunks`]), in state order.
-    pub fn signatures_for_chunk(&self, chunk: usize) -> impl Iterator<Item = &SignatureState> {
+    pub(crate) fn signatures_for_chunk(
+        &self,
+        chunk: usize,
+    ) -> impl Iterator<Item = &SignatureState> {
         self.signatures
             .iter()
             .filter(move |signature| signature.chunks.contains(&chunk))
@@ -105,7 +108,7 @@ impl SemanticState {
 
     /// Builds a state with only the chunks at `indices` and the signatures
     /// those chunks reference.
-    pub fn select_chunks(&self, indices: &[usize]) -> Self {
+    pub(crate) fn select_chunks(&self, indices: &[usize]) -> Self {
         let chunks = indices
             .iter()
             .filter_map(|&index| self.chunks.get(index).cloned())

@@ -1,6 +1,7 @@
 //! The model-agnostic System One layer: the uniform [`Decision`] every
-//! provider returns, the [`SystemOneProvider`] trait, and loading a provider
-//! by the name given to `--provider`.
+//! provider returns, the [`SystemOneProvider`] trait, cache-aware evaluation
+//! ([`evaluate_with_cache`]), and loading a provider by the name given to
+//! `--provider`.
 
 mod http;
 mod jev;
@@ -11,14 +12,23 @@ pub use jev::JevProvider;
 pub use mock::MockProvider;
 pub use ollama::OllamaProvider;
 
-use crate::state::SemanticState;
+use crate::{
+    cache::{self, Cache},
+    state::SemanticState,
+};
 use async_trait::async_trait;
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use serde_json::{Value, json};
-use std::{error::Error, fmt, str::FromStr, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    panic::{self, AssertUnwindSafe},
+    str::FromStr,
+    time::Duration,
+};
 
 /// A decision may resolve its chunk without a person only when its confidence
 /// is strictly greater than this. A confidence of exactly 0.95 does not.
@@ -348,6 +358,123 @@ pub async fn evaluate(
     Ok(evaluation)
 }
 
+/// One chunk's decision from [`evaluate_with_cache`], paired with whether it
+/// came from the SQLite decision cache (`cached: true`) or a fresh provider
+/// evaluation (`cached: false`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedDecision {
+    pub decision: Decision,
+    pub cached: bool,
+}
+
+impl ResolvedDecision {
+    pub const fn new(decision: Decision, cached: bool) -> Self {
+        Self { decision, cached }
+    }
+}
+
+/// The outcome of [`evaluate_with_cache`] across all chunks in a
+/// [`SemanticState`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchEvaluation {
+    /// One entry per chunk in `state.chunks`, in order.
+    /// `None` when a chunk missed in the cache and provider evaluation failed.
+    pub decisions: Vec<Option<ResolvedDecision>>,
+    /// Error or panic message if provider evaluation on cache misses failed.
+    pub error: Option<String>,
+}
+
+/// Evaluates `state` through `provider` and the optional SQLite `cache`
+/// (`ADR-0002`), querying only uncached chunks, skipping `Cache::put` when
+/// hoisted signatures were trimmed (`Evaluation::trimmed`), and preserving
+/// cached hits if the provider fails or panics on uncached misses.
+pub fn evaluate_with_cache(
+    provider: &dyn SystemOneProvider,
+    state: &SemanticState,
+    cache: Option<&Cache>,
+    timeout: Duration,
+) -> BatchEvaluation {
+    let mut decisions = vec![None; state.chunks.len()];
+    let cache_store = cache.and_then(|cache| provider.cache_key().map(|key| (cache, key)));
+    let keys: Vec<Option<[u8; 32]>> = (0..state.chunks.len())
+        .map(|position| {
+            cache_store
+                .as_ref()
+                .map(|(_, provider_key)| cache::chunk_key(provider_key, state, position))
+        })
+        .collect();
+
+    let mut misses = Vec::new();
+    for position in 0..state.chunks.len() {
+        if let (Some((cache, _)), Some(key)) = (&cache_store, &keys[position])
+            && let Some(decision) = cache.get(key)
+        {
+            decisions[position] = Some(ResolvedDecision::new(decision, true));
+        } else {
+            misses.push(position);
+        }
+    }
+
+    if misses.is_empty() {
+        return BatchEvaluation {
+            decisions,
+            error: None,
+        };
+    }
+
+    let name = provider.name();
+    let Ok(missed_state) = panic::catch_unwind(AssertUnwindSafe(|| state.select_chunks(&misses)))
+    else {
+        return BatchEvaluation {
+            decisions,
+            error: Some(format!("{name} evaluation failed unexpectedly")),
+        };
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return BatchEvaluation {
+                decisions,
+                error: Some(format!(
+                    "{name} evaluation skipped: cannot start a runtime: {error}"
+                )),
+            };
+        }
+    };
+    let evaluation = panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(evaluate(provider, &missed_state, timeout))
+    }));
+    runtime.shutdown_background();
+    match evaluation {
+        Ok(Ok(evaluation)) => {
+            for (&position, decision) in misses.iter().zip(evaluation.decisions) {
+                if !evaluation.trimmed
+                    && let (Some((cache, _)), Some(key)) = (&cache_store, &keys[position])
+                {
+                    cache.put(key, &decision);
+                }
+                decisions[position] = Some(ResolvedDecision::new(decision, false));
+            }
+            BatchEvaluation {
+                decisions,
+                error: None,
+            }
+        }
+        Ok(Err(error)) => BatchEvaluation {
+            decisions,
+            error: Some(format!("{name} evaluation failed: {error}")),
+        },
+        Err(_) => BatchEvaluation {
+            decisions,
+            error: Some(format!("{name} evaluation failed unexpectedly")),
+        },
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoadError {
     Unknown(String),
@@ -417,8 +544,13 @@ fn error_chain(error: &dyn Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::{ChunkState, Language};
-    use std::collections::HashMap;
+    use crate::semantic::{ChunkState, Language, SignatureState, VersionState};
+    use std::{
+        collections::{HashMap, VecDeque},
+        fs,
+        sync::Mutex,
+    };
+    use tempfile::tempdir;
 
     fn confidence(value: f64) -> Confidence {
         Confidence::new(value).unwrap()
@@ -700,5 +832,446 @@ mod tests {
                 format!("unknown provider `{name}` (available: jev, manual, mock, ollama)")
             );
         }
+    }
+
+    enum StubReply {
+        Ok(Evaluation),
+        Err(ProviderError),
+        Panic(&'static str),
+    }
+
+    struct StubProvider {
+        cache_key: Option<String>,
+        replies: Mutex<VecDeque<StubReply>>,
+        seen_states: Mutex<Vec<SemanticState>>,
+    }
+
+    impl StubProvider {
+        fn new(cache_key: Option<&str>, replies: impl IntoIterator<Item = StubReply>) -> Self {
+            Self {
+                cache_key: cache_key.map(str::to_owned),
+                replies: Mutex::new(replies.into_iter().collect()),
+                seen_states: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.seen_states.lock().unwrap().len()
+        }
+
+        fn seen_states(&self) -> Vec<SemanticState> {
+            self.seen_states.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SystemOneProvider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        fn cache_key(&self) -> Option<String> {
+            self.cache_key.clone()
+        }
+
+        async fn evaluate(&self, state: &SemanticState) -> Result<Evaluation, ProviderError> {
+            self.seen_states.lock().unwrap().push(state.clone());
+            match self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected provider call")
+            {
+                StubReply::Ok(evaluation) => Ok(evaluation),
+                StubReply::Err(error) => Err(error),
+                StubReply::Panic(message) => panic!("{message}"),
+            }
+        }
+    }
+
+    fn version_state(code: &str) -> Option<VersionState> {
+        Some(VersionState {
+            lines: 1..=3,
+            code: code.to_owned(),
+            changes: None,
+        })
+    }
+
+    fn three_chunk_state() -> SemanticState {
+        SemanticState {
+            file: "src/lib.rs".to_owned(),
+            language: Language::Rust,
+            chunks: ["alpha", "beta", "gamma"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| ChunkState {
+                    items: vec![format!("fn {name}")],
+                    summary: format!("chunk {index}"),
+                    base: version_state(&format!("fn {name}() -> u32 {{ {index} }}")),
+                    ours: version_state(&format!("fn {name}() -> u32 {{ {} }}", index + 10)),
+                    theirs: version_state(&format!("fn {name}() -> u32 {{ {} }}", index + 100)),
+                })
+                .collect(),
+            signatures: vec![
+                SignatureState {
+                    item: "struct Shared".to_owned(),
+                    signature: Some("struct Shared {\n    id: u64,\n}".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0, 1],
+                },
+                SignatureState {
+                    item: "struct AlphaOnly".to_owned(),
+                    signature: Some("struct AlphaOnly;".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "struct BetaOnly".to_owned(),
+                    signature: Some("struct BetaOnly;".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![1],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn evaluate_with_cache_records_misses_and_serves_full_hits_without_calling_provider() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(&dir.path().join("git-weld/cache")).unwrap();
+        let full_state = three_chunk_state().select_chunks(&[0, 1]);
+        let d0 = Decision::new(MergeAction::TakeOurs, confidence(0.99), "ours 0");
+        let d1 = Decision::new(MergeAction::Manual, confidence(0.70), "manual 1");
+
+        let first_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Ok(Evaluation::untrimmed(vec![
+                d0.clone(),
+                d1.clone(),
+            ]))],
+        );
+        let first = evaluate_with_cache(
+            &first_provider,
+            &full_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(first_provider.calls(), 1);
+        assert_eq!(
+            first,
+            BatchEvaluation {
+                decisions: vec![
+                    Some(ResolvedDecision::new(d0.clone(), false)),
+                    Some(ResolvedDecision::new(d1.clone(), false)),
+                ],
+                error: None,
+            }
+        );
+
+        let hit_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Panic("full cache hit must not call provider")],
+        );
+        let second = evaluate_with_cache(
+            &hit_provider,
+            &full_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(hit_provider.calls(), 0);
+        assert_eq!(
+            second,
+            BatchEvaluation {
+                decisions: vec![
+                    Some(ResolvedDecision::new(d0, true)),
+                    Some(ResolvedDecision::new(d1, true)),
+                ],
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_cache_subsets_partial_misses_and_reassembles_decisions_in_chunk_order() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(&dir.path().join("git-weld/cache")).unwrap();
+        let state = three_chunk_state();
+        let d_alpha = Decision::new(MergeAction::TakeOurs, confidence(0.99), "alpha");
+        let d_beta = Decision::new(MergeAction::Manual, confidence(0.65), "beta");
+        let d_gamma = Decision::new(MergeAction::TakeTheirs, confidence(0.98), "gamma");
+
+        // Seed chunks 0 (`fn alpha`) and 2 (`fn gamma`) into the SQLite cache.
+        let seeded_state = state.select_chunks(&[0, 2]);
+        let seed_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Ok(Evaluation::untrimmed(vec![
+                d_alpha.clone(),
+                d_gamma.clone(),
+            ]))],
+        );
+        let seeded = evaluate_with_cache(
+            &seed_provider,
+            &seeded_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(seeded.error, None);
+        assert_eq!(seed_provider.calls(), 1);
+
+        // Evaluating all 3 chunks sends only chunk 1 (`fn beta`) and its referenced
+        // signatures (`struct Shared` and `struct BetaOnly`, remapped to index 0).
+        let miss_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Ok(Evaluation::untrimmed(vec![d_beta.clone()]))],
+        );
+        let partial =
+            evaluate_with_cache(&miss_provider, &state, Some(&cache), Duration::from_secs(5));
+        assert_eq!(miss_provider.calls(), 1);
+        let seen = &miss_provider.seen_states()[0];
+        assert_eq!(seen.chunks.len(), 1);
+        assert_eq!(seen.chunks[0].items, ["fn beta"]);
+        assert_eq!(
+            seen.signatures,
+            vec![
+                SignatureState {
+                    item: "struct Shared".to_owned(),
+                    signature: Some("struct Shared {\n    id: u64,\n}".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+                SignatureState {
+                    item: "struct BetaOnly".to_owned(),
+                    signature: Some("struct BetaOnly;".to_owned()),
+                    base: None,
+                    ours: None,
+                    theirs: None,
+                    chunks: vec![0],
+                },
+            ]
+        );
+        assert_eq!(
+            partial,
+            BatchEvaluation {
+                decisions: vec![
+                    Some(ResolvedDecision::new(d_alpha.clone(), true)),
+                    Some(ResolvedDecision::new(d_beta.clone(), false)),
+                    Some(ResolvedDecision::new(d_gamma.clone(), true)),
+                ],
+                error: None,
+            }
+        );
+
+        // All 3 chunks are now cached.
+        let verify_provider = StubProvider::new(Some("stub:model:v1"), []);
+        let all_cached = evaluate_with_cache(
+            &verify_provider,
+            &state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(verify_provider.calls(), 0);
+        assert_eq!(
+            all_cached,
+            BatchEvaluation {
+                decisions: vec![
+                    Some(ResolvedDecision::new(d_alpha, true)),
+                    Some(ResolvedDecision::new(d_beta, true)),
+                    Some(ResolvedDecision::new(d_gamma, true)),
+                ],
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_cache_preserves_cached_decisions_when_provider_errors_or_panics_on_misses() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(&dir.path().join("git-weld/cache")).unwrap();
+        let state = three_chunk_state();
+        let d_alpha = Decision::new(MergeAction::TakeOurs, confidence(0.99), "alpha");
+        let d_gamma = Decision::new(MergeAction::TakeTheirs, confidence(0.98), "gamma");
+
+        let seed_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Ok(Evaluation::untrimmed(vec![
+                d_alpha.clone(),
+                d_gamma.clone(),
+            ]))],
+        );
+        evaluate_with_cache(
+            &seed_provider,
+            &state.select_chunks(&[0, 2]),
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+
+        let failing_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Err(ProviderError::Http {
+                status: 503,
+                message: "service unavailable".to_owned(),
+            })],
+        );
+        let failed = evaluate_with_cache(
+            &failing_provider,
+            &state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            failed,
+            BatchEvaluation {
+                decisions: vec![
+                    Some(ResolvedDecision::new(d_alpha.clone(), true)),
+                    None,
+                    Some(ResolvedDecision::new(d_gamma.clone(), true)),
+                ],
+                error: Some("stub evaluation failed: HTTP 503: service unavailable".to_owned()),
+            }
+        );
+
+        let panicking_provider =
+            StubProvider::new(Some("stub:model:v1"), [StubReply::Panic("boom")]);
+        let panicked = evaluate_with_cache(
+            &panicking_provider,
+            &state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            panicked,
+            BatchEvaluation {
+                decisions: vec![
+                    Some(ResolvedDecision::new(d_alpha, true)),
+                    None,
+                    Some(ResolvedDecision::new(d_gamma, true)),
+                ],
+                error: Some("stub evaluation failed unexpectedly".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_cache_bypasses_writes_for_trimmed_or_unkeyed_providers_and_degrades_on_cache_errors()
+     {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("git-weld/cache");
+        let cache = Cache::open(&db_path).unwrap();
+        let single_state = three_chunk_state().select_chunks(&[0]);
+        let d0 = Decision::new(MergeAction::TakeOurs, confidence(0.99), "alpha");
+
+        // ADR-0002: trimmed evaluations return fresh decisions (`cached: false`)
+        // without storing them in SQLite.
+        let trimmed_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [
+                StubReply::Ok(Evaluation::trimmed(vec![d0.clone()])),
+                StubReply::Ok(Evaluation::untrimmed(vec![d0.clone()])),
+            ],
+        );
+        let first = evaluate_with_cache(
+            &trimmed_provider,
+            &single_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            first,
+            BatchEvaluation {
+                decisions: vec![Some(ResolvedDecision::new(d0.clone(), false))],
+                error: None,
+            }
+        );
+        let second = evaluate_with_cache(
+            &trimmed_provider,
+            &single_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(trimmed_provider.calls(), 2);
+        assert_eq!(
+            second,
+            BatchEvaluation {
+                decisions: vec![Some(ResolvedDecision::new(d0.clone(), false))],
+                error: None,
+            }
+        );
+        let third = evaluate_with_cache(
+            &trimmed_provider,
+            &single_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(trimmed_provider.calls(), 2);
+        assert_eq!(
+            third,
+            BatchEvaluation {
+                decisions: vec![Some(ResolvedDecision::new(d0.clone(), true))],
+                error: None,
+            }
+        );
+
+        // Providers with `cache_key() == None` never read or write the SQLite cache.
+        let unkeyed = StubProvider::new(
+            None,
+            [
+                StubReply::Ok(Evaluation::untrimmed(vec![d0.clone()])),
+                StubReply::Ok(Evaluation::untrimmed(vec![d0.clone()])),
+            ],
+        );
+        for _ in 0..2 {
+            let outcome = evaluate_with_cache(
+                &unkeyed,
+                &single_state,
+                Some(&cache),
+                Duration::from_secs(5),
+            );
+            assert_eq!(
+                outcome,
+                BatchEvaluation {
+                    decisions: vec![Some(ResolvedDecision::new(d0.clone(), false))],
+                    error: None,
+                }
+            );
+        }
+        assert_eq!(unkeyed.calls(), 2);
+
+        // Corrupt or damaged SQLite state degrades gracefully to uncached evaluation.
+        let bad_path = dir.path().join("corrupt-cache");
+        fs::write(&bad_path, b"not a sqlite file").unwrap();
+        let reopened = Cache::open(&bad_path);
+        assert!(reopened.is_none());
+
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("DROP TABLE decisions", [])
+            .unwrap();
+        let fallback_provider = StubProvider::new(
+            Some("stub:model:v1"),
+            [StubReply::Ok(Evaluation::untrimmed(vec![d0.clone()]))],
+        );
+        let degraded = evaluate_with_cache(
+            &fallback_provider,
+            &single_state,
+            Some(&cache),
+            Duration::from_secs(5),
+        );
+        assert_eq!(fallback_provider.calls(), 1);
+        assert_eq!(
+            degraded,
+            BatchEvaluation {
+                decisions: vec![Some(ResolvedDecision::new(d0, false))],
+                error: None,
+            }
+        );
     }
 }

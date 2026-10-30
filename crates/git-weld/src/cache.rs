@@ -7,6 +7,7 @@
 //! Theirs stay in order so swapping sides never reuses `TakeOurs` or
 //! `TakeTheirs` backwards. Any cache failure counts as a silent miss.
 
+pub use crate::provider::{BatchEvaluation, ResolvedDecision, evaluate_with_cache};
 use crate::{
     provider::{Confidence, Decision, MergeAction},
     state::SemanticState,
@@ -144,7 +145,7 @@ pub fn locate(work_dir: &Path) -> Option<PathBuf> {
 
 /// Computes the SHA-256 cache key for `state.chunks[chunk_index]` and the
 /// hoisted signatures it references.
-pub fn chunk_key(provider_key: &str, state: &SemanticState, chunk_index: usize) -> [u8; 32] {
+pub(crate) fn chunk_key(provider_key: &str, state: &SemanticState, chunk_index: usize) -> [u8; 32] {
     let chunk = &state.chunks[chunk_index];
     let mut hasher = Sha256::new();
     write_bytes(&mut hasher, b'V', CACHE_KEY_VERSION);
