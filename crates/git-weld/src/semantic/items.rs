@@ -146,6 +146,7 @@ pub(super) fn extract(language: Language, source: &str, tree: &Tree) -> Vec<Item
             node_kind: root.kind().to_owned(),
             bytes: 0..source.len(),
             lines: 1..=source.lines().count().max(1),
+            index: 0,
         },
         fingerprint: String::new(),
         container: true,
@@ -216,6 +217,7 @@ pub(super) fn extract(language: Language, source: &str, tree: &Tree) -> Vec<Item
                     node_kind: child.kind().to_owned(),
                     bytes: start.start_byte()..child.end_byte(),
                     lines: line_span(start, child),
+                    index: 0,
                 },
                 fingerprint,
                 container: declaration.body.is_some(),
@@ -237,6 +239,9 @@ pub(super) fn extract(language: Language, source: &str, tree: &Tree) -> Vec<Item
     }
 
     items.sort_by_key(|item| (item.location.bytes.start, Reverse(item.location.bytes.end)));
+    for (index, item) in items.iter_mut().enumerate() {
+        item.location.index = index;
+    }
     items
 }
 

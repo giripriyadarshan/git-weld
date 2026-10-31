@@ -542,14 +542,19 @@ fn error_chain(error: &dyn Error) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn test_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+    let values: std::collections::HashMap<String, String> = pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect();
+    move |key| values.get(key).cloned()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::semantic::{ChunkState, Language, SignatureState, VersionState};
-    use std::{
-        collections::{HashMap, VecDeque},
-        fs,
-        sync::Mutex,
-    };
+    use std::{collections::VecDeque, fs, sync::Mutex};
     use tempfile::tempdir;
 
     fn confidence(value: f64) -> Confidence {
@@ -571,14 +576,6 @@ mod tests {
                 .collect(),
             signatures: Vec::new(),
         }
-    }
-
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
-        let values: HashMap<String, String> = pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect();
-        move |key| values.get(key).cloned()
     }
 
     #[test]
@@ -785,7 +782,7 @@ mod tests {
 
     #[test]
     fn loads_providers_by_name() {
-        let configured = env(&[
+        let configured = test_env(&[
             ("TYPESAFE_API_KEY", "ts-key"),
             ("OLLAMA_MODEL", "kev:0.8b-bf16"),
             (
@@ -793,7 +790,7 @@ mod tests {
                 r#"{"decision": "Manual", "confidence": 1, "reason": ""}"#,
             ),
         ]);
-        let empty = env(&[]);
+        let empty = test_env(&[]);
 
         assert!(load("manual", &empty).unwrap().is_none());
         assert!(load("Manual", &empty).unwrap().is_none());

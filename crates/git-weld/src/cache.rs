@@ -7,7 +7,6 @@
 //! Theirs stay in order so swapping sides never reuses `TakeOurs` or
 //! `TakeTheirs` backwards. Any cache failure counts as a silent miss.
 
-pub use crate::provider::{BatchEvaluation, ResolvedDecision, evaluate_with_cache};
 use crate::{
     provider::{Confidence, Decision, MergeAction},
     state::SemanticState,

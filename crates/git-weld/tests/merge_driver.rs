@@ -1,6 +1,6 @@
 mod support;
 
-use git_weld::{DriverError, DriverOptions, MergeOutcome, provider, run_driver};
+use git_weld::{DriverOptions, MergeOutcome, provider, run_driver};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -130,7 +130,7 @@ impl MergeFixture {
         provider_name: &str,
         no_cache: bool,
         env_pairs: &[(&str, &str)],
-    ) -> (Result<MergeOutcome, DriverError>, String) {
+    ) -> (anyhow::Result<MergeOutcome>, String) {
         let base = self.path("base");
         let ours = self.path("ours");
         let theirs = self.path("theirs");
@@ -1933,8 +1933,23 @@ fn workspace_release_metadata_and_docs_enforce_adr_0003_and_prose_standards() {
         "lib.rs must expose run_driver and keep log internal"
     );
     assert!(
+        !lib_rs.contains("pub type DriverError"),
+        "lib.rs must not expose pub type DriverError"
+    );
+    assert!(
         !src_dir.join("ast.rs").exists() && !src_dir.join("chunk.rs").exists(),
         "ast and chunk modules must stay collapsed into semantic.rs"
+    );
+
+    let cache_rs = fs::read_to_string(src_dir.join("cache.rs")).unwrap();
+    assert!(
+        !cache_rs.contains("pub use crate::provider"),
+        "cache.rs must not re-export crate::provider types"
+    );
+    let semantic_rs = fs::read_to_string(src_dir.join("semantic.rs")).unwrap();
+    assert!(
+        !semantic_rs.contains("ranges_overlap"),
+        "semantic.rs must use Outline::shares_lineage and Chunk.covered rather than ranges_overlap"
     );
 
     let ollama_rs = fs::read_to_string(src_dir.join("provider/ollama.rs")).unwrap();

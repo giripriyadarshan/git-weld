@@ -64,14 +64,6 @@ impl JevProvider {
         self.http = self.http.with_retries(max_retries, initial_backoff);
         self
     }
-
-    pub fn endpoint(&self) -> &str {
-        self.http.endpoint()
-    }
-
-    pub fn model(&self) -> &str {
-        self.http.model()
-    }
 }
 
 impl fmt::Debug for JevProvider {
@@ -97,39 +89,33 @@ impl SystemOneProvider for JevProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashMap;
+    use super::{super::test_env, *};
 
     #[test]
     fn reads_its_configuration_from_the_environment() {
-        let env = |pairs: &[(&str, &str)]| {
-            let values: HashMap<String, String> = pairs
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect();
-            move |key: &str| values.get(key).cloned()
-        };
-
         let defaults =
-            JevProvider::from_env(&env(&[("TYPESAFE_API_KEY", " ts-secret\n")])).unwrap();
-        assert_eq!(defaults.endpoint(), "https://api.typesafe.ai/v1/systemone");
-        assert_eq!(defaults.model(), "jev-latest");
+            JevProvider::from_env(&test_env(&[("TYPESAFE_API_KEY", " ts-secret\n")])).unwrap();
+        assert_eq!(
+            defaults.http.endpoint(),
+            "https://api.typesafe.ai/v1/systemone"
+        );
+        assert_eq!(defaults.http.model(), "jev-latest");
         assert_eq!(
             defaults.cache_key().as_deref(),
             Some("jev:jev-latest:systemone-choice-v1")
         );
 
-        let custom = JevProvider::from_env(&env(&[
+        let custom = JevProvider::from_env(&test_env(&[
             ("TYPESAFE_API_KEY", "ts-secret"),
             ("TYPESAFE_BASE_URL", "https://gateway.example/typesafe/"),
             ("TYPESAFE_DEFAULT_MODEL", "jev-1.13.0"),
         ]))
         .unwrap();
         assert_eq!(
-            custom.endpoint(),
+            custom.http.endpoint(),
             "https://gateway.example/typesafe/v1/systemone"
         );
-        assert_eq!(custom.model(), "jev-1.13.0");
+        assert_eq!(custom.http.model(), "jev-1.13.0");
 
         let debug = format!("{custom:?}");
         assert!(debug.contains("jev-1.13.0"), "{debug}");
@@ -137,7 +123,9 @@ mod tests {
         assert!(!debug.contains("ts-secret"), "{debug}");
 
         assert_eq!(
-            JevProvider::from_env(&env(&[])).unwrap_err().to_string(),
+            JevProvider::from_env(&test_env(&[]))
+                .unwrap_err()
+                .to_string(),
             "TYPESAFE_API_KEY is not set"
         );
     }
@@ -217,7 +205,10 @@ mod tests {
             "http://[::1]:9/",
         ] {
             let provider = JevProvider::new(local, "ts-secret", "jev-latest").unwrap();
-            assert!(provider.endpoint().ends_with("/v1/systemone"), "{local}");
+            assert!(
+                provider.http.endpoint().ends_with("/v1/systemone"),
+                "{local}"
+            );
         }
     }
 }

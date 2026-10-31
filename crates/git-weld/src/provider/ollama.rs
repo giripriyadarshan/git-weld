@@ -51,14 +51,6 @@ impl OllamaProvider {
         self.http = self.http.with_retries(max_retries, initial_backoff);
         self
     }
-
-    pub fn endpoint(&self) -> &str {
-        self.http.endpoint()
-    }
-
-    pub fn model(&self) -> &str {
-        self.http.model()
-    }
 }
 
 impl fmt::Debug for OllamaProvider {
@@ -101,58 +93,58 @@ fn ollama_endpoint(host: &str) -> Result<Url, ProviderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::HashMap;
+    use super::{super::test_env, *};
 
     #[test]
     fn reads_ollama_settings_and_accepts_bare_hosts() {
-        let env = |pairs: &[(&str, &str)]| {
-            let values: HashMap<String, String> = pairs
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect();
-            move |key: &str| values.get(key).cloned()
-        };
-
         let defaults =
-            OllamaProvider::from_env(&env(&[("OLLAMA_MODEL", " kev:0.8b-bf16\n")])).unwrap();
-        assert_eq!(defaults.endpoint(), "http://127.0.0.1:11434/v1/systemone");
-        assert_eq!(defaults.model(), "kev:0.8b-bf16");
+            OllamaProvider::from_env(&test_env(&[("OLLAMA_MODEL", " kev:0.8b-bf16\n")])).unwrap();
+        assert_eq!(
+            defaults.http.endpoint(),
+            "http://127.0.0.1:11434/v1/systemone"
+        );
+        assert_eq!(defaults.http.model(), "kev:0.8b-bf16");
         assert_eq!(
             defaults.cache_key().as_deref(),
             Some("ollama:kev:0.8b-bf16:systemone-choice-v1")
         );
 
-        let bare = OllamaProvider::from_env(&env(&[
+        let bare = OllamaProvider::from_env(&test_env(&[
             ("OLLAMA_MODEL", "laya:latest"),
             ("OLLAMA_HOST", "localhost"),
         ]))
         .unwrap();
-        assert_eq!(bare.endpoint(), "http://localhost:11434/v1/systemone");
-        assert_eq!(bare.model(), "laya:latest");
+        assert_eq!(bare.http.endpoint(), "http://localhost:11434/v1/systemone");
+        assert_eq!(bare.http.model(), "laya:latest");
 
-        let bare_port = OllamaProvider::from_env(&env(&[
+        let bare_port = OllamaProvider::from_env(&test_env(&[
             ("OLLAMA_MODEL", "clef-flash:latest"),
             ("OLLAMA_HOST", "127.0.0.1:11435"),
         ]))
         .unwrap();
-        assert_eq!(bare_port.endpoint(), "http://127.0.0.1:11435/v1/systemone");
+        assert_eq!(
+            bare_port.http.endpoint(),
+            "http://127.0.0.1:11435/v1/systemone"
+        );
 
-        let v1_suffix = OllamaProvider::from_env(&env(&[
+        let v1_suffix = OllamaProvider::from_env(&test_env(&[
             ("OLLAMA_MODEL", "kev:0.8b-bf16"),
             ("OLLAMA_HOST", "http://127.0.0.1:11434/v1"),
         ]))
         .unwrap();
-        assert_eq!(v1_suffix.endpoint(), "http://127.0.0.1:11434/v1/systemone");
+        assert_eq!(
+            v1_suffix.http.endpoint(),
+            "http://127.0.0.1:11434/v1/systemone"
+        );
 
-        let remote = OllamaProvider::from_env(&env(&[
+        let remote = OllamaProvider::from_env(&test_env(&[
             ("OLLAMA_MODEL", "kev:0.8b-bf16"),
             ("OLLAMA_HOST", "https://ollama.example.com/api"),
             ("OLLAMA_API_KEY", "ollama-secret"),
         ]))
         .unwrap();
         assert_eq!(
-            remote.endpoint(),
+            remote.http.endpoint(),
             "https://ollama.example.com/api/v1/systemone"
         );
         let debug = format!("{remote:?}");
@@ -161,7 +153,9 @@ mod tests {
         assert!(!debug.contains("ollama-secret"), "{debug}");
 
         assert_eq!(
-            OllamaProvider::from_env(&env(&[])).unwrap_err().to_string(),
+            OllamaProvider::from_env(&test_env(&[]))
+                .unwrap_err()
+                .to_string(),
             "OLLAMA_MODEL is not set"
         );
     }

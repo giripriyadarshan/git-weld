@@ -24,10 +24,6 @@ use provider::{AUTO_RESOLVE_THRESHOLD, Decision, MergeAction, SystemOneProvider}
 use semantic::{Chunk, DivergedItem, Divergence, MAX_CLEAN_ANALYZE_BYTES, SemanticMerge};
 use std::{io::Write, ops::RangeInclusive, path::Path, time::Duration};
 
-/// An I/O or filesystem error that prevented [`run_driver`] from reading the
-/// merge inputs or atomically writing `%A`.
-pub type DriverError = anyhow::Error;
-
 /// Inputs and configuration for a single [`run_driver`] invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriverOptions<'a> {
@@ -57,7 +53,7 @@ pub fn run_driver(
     env: provider::Env<'_>,
     work_dir: &Path,
     diagnostics: &mut dyn Write,
-) -> Result<MergeOutcome, DriverError> {
+) -> anyhow::Result<MergeOutcome> {
     let versions = Versions::read(options.base, options.ours, options.theirs)?;
     let merge = match LineMerge::new(&versions) {
         Ok(merge) => merge,

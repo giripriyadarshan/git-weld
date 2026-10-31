@@ -152,6 +152,7 @@ pub struct Location {
     pub node_kind: String,
     pub bytes: Range<usize>,
     pub lines: RangeInclusive<usize>,
+    index: usize,
 }
 
 impl fmt::Display for DivergedItem {
@@ -217,7 +218,7 @@ impl Chunk {
         &self.covered[version as usize]
     }
 
-    fn overlaps_diverged(&self, merge: &LineMerge, diverged: &DivergedItem) -> bool {
+    fn overlaps_diverged(&self, outlines: &[Outline; 3], diverged: &DivergedItem) -> bool {
         [
             (Version::Base, &diverged.base),
             (Version::Ours, &diverged.ours),
@@ -226,10 +227,10 @@ impl Chunk {
         .into_iter()
         .any(|(version, location)| {
             location.as_ref().is_some_and(|location| {
-                ranges_overlap(
-                    &location.bytes,
-                    &merge.span_bytes(version, self.regions.clone()),
-                )
+                let outline = &outlines[version as usize];
+                self.covered(version)
+                    .iter()
+                    .any(|&root| outline.shares_lineage(root, location.index))
             })
         })
     }
@@ -281,7 +282,7 @@ impl<'a> SemanticMerge<'a> {
                 .filter(|diverged| {
                     !chunks
                         .iter()
-                        .any(|chunk| chunk.overlaps_diverged(merge, diverged))
+                        .any(|chunk| chunk.overlaps_diverged(&analysis.outlines, diverged))
                 })
                 .cloned()
                 .collect();
@@ -510,6 +511,23 @@ impl Outline {
         found
     }
 
+    fn shares_lineage(&self, first: usize, second: usize) -> bool {
+        first == second || self.is_ancestor(first, second) || self.is_ancestor(second, first)
+    }
+
+    fn is_ancestor(&self, ancestor: usize, mut item: usize) -> bool {
+        while let Some(parent) = self.item(item).parent {
+            if parent == Self::ROOT {
+                break;
+            }
+            if parent == ancestor {
+                return true;
+            }
+            item = parent;
+        }
+        false
+    }
+
     fn collect_covered_keys<'a>(
         &'a self,
         span: &Range<usize>,
@@ -550,10 +568,6 @@ impl Outline {
             }
         }
     }
-}
-
-fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
 }
 
 fn range_contains(outer: &Range<usize>, inner: &Range<usize>) -> bool {
@@ -919,14 +933,14 @@ fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<DivergedItem> {
             theirs_index.get(key).copied(),
         );
         let kind = match (old, new_ours, new_theirs) {
-            (Some(old), Some(new_ours), Some(new_theirs))
+            (Some((_, old)), Some((_, new_ours)), Some((_, new_theirs)))
                 if old.fingerprint != new_ours.fingerprint
                     && old.fingerprint != new_theirs.fingerprint
                     && new_ours.fingerprint != new_theirs.fingerprint =>
             {
                 Divergence::BothModified
             }
-            (None, Some(new_ours), Some(new_theirs))
+            (None, Some((_, new_ours)), Some((_, new_theirs)))
                 if new_ours.fingerprint != new_theirs.fingerprint =>
             {
                 Divergence::BothAdded
@@ -944,33 +958,42 @@ fn compare(base: &[Item], ours: &[Item], theirs: &[Item]) -> Vec<DivergedItem> {
         let path = new_ours
             .or(new_theirs)
             .or(old)
-            .map(|item| item.path.clone());
+            .map(|(_, item)| item.path.clone());
+        let locate = |(index, item): (usize, &Item)| Location {
+            index,
+            ..item.location.clone()
+        };
         diverged.push(DivergedItem {
             item: path.unwrap_or_default(),
             kind,
-            base: old.map(|item| item.location.clone()),
-            ours: new_ours.map(|item| item.location.clone()),
-            theirs: new_theirs.map(|item| item.location.clone()),
+            base: old.map(locate),
+            ours: new_ours.map(locate),
+            theirs: new_theirs.map(locate),
         });
     }
     diverged
 }
 
-fn index(items: &[Item]) -> HashMap<&[Segment], &Item> {
+fn index(items: &[Item]) -> HashMap<&[Segment], (usize, &Item)> {
     items
         .iter()
-        .map(|item| (item.key.as_slice(), item))
+        .enumerate()
+        .map(|(position, item)| (item.key.as_slice(), (position, item)))
         .collect()
 }
 
 // Whether `side` added or modified the item at `key` or anything inside it.
 // Removing children of an item that the other side deleted is compatible.
-fn adds_or_modifies(key: &[Segment], base: &HashMap<&[Segment], &Item>, side: &[Item]) -> bool {
+fn adds_or_modifies(
+    key: &[Segment],
+    base: &HashMap<&[Segment], (usize, &Item)>,
+    side: &[Item],
+) -> bool {
     side.iter()
         .filter(|item| item.key.starts_with(key))
         .any(|item| {
             base.get(item.key.as_slice())
-                .is_none_or(|original| original.fingerprint != item.fingerprint)
+                .is_none_or(|(_, original)| original.fingerprint != item.fingerprint)
         })
 }
 
@@ -1028,12 +1051,14 @@ class Greeter:
         snippet: &str,
         node_kind: &str,
         lines: RangeInclusive<usize>,
+        index: usize,
     ) -> Location {
         let start = source.find(snippet).expect("snippet is in the source");
         Location {
             node_kind: node_kind.to_owned(),
             bytes: start..start + snippet.len(),
             lines,
+            index,
         }
     }
 
@@ -1340,19 +1365,22 @@ class Greeter:
                     RUST_BASE,
                     "fn alpha() -> u32 {\n    1\n}",
                     "function_item",
-                    1..=3
+                    1..=3,
+                    1,
                 )),
                 ours: Some(location(
                     &ours,
                     "fn alpha() -> u32 {\n    10\n}",
                     "function_item",
-                    1..=3
+                    1..=3,
+                    1,
                 )),
                 theirs: Some(location(
                     &theirs,
                     "fn alpha() -> u32 {\n    100\n}",
                     "function_item",
-                    3..=5
+                    3..=5,
+                    2,
                 )),
             }]
         );
@@ -1380,6 +1408,46 @@ class Greeter:
         assert_eq!(semantic.combined_items().len(), 1);
         assert_eq!(semantic.combined_items()[0].item, "fn alpha");
         assert_eq!(semantic.combined_items()[0].kind, Divergence::BothModified);
+
+        let container_base = "// Counter impl.\nimpl Counter {\n    fn get(&self) -> u32 {\n        let a = 1;\n        let b = 2;\n        let c = 3;\n        a + b + c\n    }\n\n    fn reset(&mut self) {\n        self.value = 0;\n    }\n}\n";
+        let sibling_ours = container_base
+            .replace("= 1", "= 10")
+            .replace("self.value = 0;", "self.value = 1;");
+        let sibling_theirs = container_base
+            .replace("= 3", "= 30")
+            .replace("self.value = 0;", "self.value = 2;");
+        let sibling_versions = Versions {
+            base: container_base.as_bytes().to_vec(),
+            ours: sibling_ours.as_bytes().to_vec(),
+            theirs: sibling_theirs.as_bytes().to_vec(),
+        };
+        let sibling_merge = LineMerge::new(&sibling_versions).unwrap();
+        let sibling_semantic = SemanticMerge::analyze(Path::new("src/lib.rs"), &sibling_merge);
+        assert_eq!(
+            sibling_semantic.chunks()[0].item_paths(),
+            ["impl Counter > fn reset"]
+        );
+        assert_eq!(sibling_semantic.combined_items().len(), 1);
+        assert_eq!(
+            sibling_semantic.combined_items()[0].item,
+            "impl Counter > fn get"
+        );
+
+        let header_ours = container_base
+            .replace("// Counter impl.", "// Ours impl.")
+            .replace("= 1", "= 10");
+        let header_theirs = container_base
+            .replace("// Counter impl.", "// Theirs impl.")
+            .replace("= 3", "= 30");
+        let header_versions = Versions {
+            base: container_base.as_bytes().to_vec(),
+            ours: header_ours.as_bytes().to_vec(),
+            theirs: header_theirs.as_bytes().to_vec(),
+        };
+        let header_merge = LineMerge::new(&header_versions).unwrap();
+        let header_semantic = SemanticMerge::analyze(Path::new("src/lib.rs"), &header_merge);
+        assert_eq!(header_semantic.chunks()[0].item_paths(), ["impl Counter"]);
+        assert!(header_semantic.combined_items().is_empty());
     }
 
     #[test]
@@ -1518,19 +1586,22 @@ class Greeter:
                     PYTHON_BASE,
                     "def alpha():\n    return 1",
                     "function_definition",
-                    4..=5
+                    4..=5,
+                    2,
                 )),
                 ours: Some(location(
                     &ours,
                     "def alpha():\n    return 10",
                     "function_definition",
-                    4..=5
+                    4..=5,
+                    2,
                 )),
                 theirs: Some(location(
                     &theirs,
                     "def alpha():\n    return 100",
                     "function_definition",
-                    5..=6
+                    5..=6,
+                    3,
                 )),
             }]
         );
@@ -1618,7 +1689,8 @@ class Box:
                 &ours,
                 "@size.setter\n    def size(self, value):\n        self._size = value * 2",
                 "decorated_definition",
-                6..=8
+                6..=8,
+                3,
             ))
         );
         assert_eq!(summary("box.py", base, &getter, &ours), []);

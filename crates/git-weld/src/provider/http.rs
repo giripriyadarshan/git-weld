@@ -114,10 +114,12 @@ impl SystemOneClient {
         self
     }
 
+    #[cfg(test)]
     pub(super) fn endpoint(&self) -> &str {
         self.endpoint.as_str()
     }
 
+    #[cfg(test)]
     pub(super) fn model(&self) -> &str {
         &self.model
     }
